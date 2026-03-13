@@ -230,9 +230,10 @@ def init_db():
 
 def fetch_json(url, timeout=5):
     try:
-        req = Request(url, headers={"User-Agent": "GradSniper/6.0"})
+        req = Request(url, headers={"User-Agent": "GradSniper/6.0", "Accept": "application/json"})
         with urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read(500000)  # Max 500KB — kill huge responses
+            return json.loads(raw.decode())
     except Exception as e:
         stats["errors"] += 1
         return None
@@ -260,13 +261,24 @@ def calc_return(initial_price, current_price):
         return None
 
 def get_sol_price():
-    data = fetch_json(f"{DEXSCREENER_BASE}/latest/dex/search?q=SOL%20USDC%20solana")
-    if data and data.get("pairs"):
-        for pair in data["pairs"]:
-            if pair.get("baseToken", {}).get("symbol") == "SOL":
-                try: return float(pair.get("priceUsd", 0))
-                except: pass
-    return 0.0
+    # Non-blocking: run in thread with hard 4s kill
+    result = [0.0]
+    def _fetch():
+        try:
+            data = fetch_json(f"{DEXSCREENER_BASE}/token-pairs/v1/solana/So11111111111111111111111111111111111111112")
+            if data and isinstance(data, list):
+                for pair in data[:3]:
+                    try:
+                        p = float(pair.get("priceUsd", 0) or 0)
+                        if p > 0:
+                            result[0] = p
+                            return
+                    except: pass
+        except: pass
+    t = threading.Thread(target=_fetch)
+    t.start()
+    t.join(timeout=4)
+    return result[0]
 
 def update_fear_greed():
     global fear_greed_value, fear_greed_label
@@ -1102,17 +1114,31 @@ def _classify():
 
 # ── Main Loop ───────────────────────────────────────────────────────────
 
-def _safe(label, fn, *args):
-    """Run a function safely — log errors but never crash the loop."""
-    try:
-        _log(f"  → {label}...")
-        result = fn(*args)
-        _log(f"  ✓ {label} done")
-        return result
-    except Exception as e:
+def _safe(label, fn, *args, max_sec=30):
+    """Run a function safely with hard timeout."""
+    result = [None]
+    error = [None]
+    def _run():
+        try:
+            result[0] = fn(*args)
+        except Exception as e:
+            error[0] = e
+    
+    _log(f"  → {label}")
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join(timeout=max_sec)
+    
+    if t.is_alive():
         stats["errors"] += 1
-        _log(f"  ✗ {label} ERROR: {e}")
+        _log(f"  ✗ {label} TIMEOUT ({max_sec}s)")
         return None
+    if error[0]:
+        stats["errors"] += 1
+        _log(f"  ✗ {label}: {error[0]}")
+        return None
+    _log(f"  ✓ {label}")
+    return result[0]
 
 def main_loop():
     global sol_price_usd
