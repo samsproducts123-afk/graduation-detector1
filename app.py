@@ -228,7 +228,7 @@ def init_db():
 
 # ── API Helpers ─────────────────────────────────────────────────────────
 
-def fetch_json(url, timeout=10):
+def fetch_json(url, timeout=5):
     try:
         req = Request(url, headers={"User-Agent": "GradSniper/6.0"})
         with urlopen(req, timeout=timeout) as resp:
@@ -360,7 +360,7 @@ def _pre_score():
     candidates = conn.execute("""
         SELECT mint, symbol FROM watchlist 
         WHERE pre_scored=0 AND graduated=0 AND last_seen_mcap >= ?
-        ORDER BY velocity_score DESC LIMIT 5
+        ORDER BY velocity_score DESC LIMIT 2
     """, (GRADUATION_MCAP * 0.80,)).fetchall()
     
     for token in candidates:
@@ -437,7 +437,7 @@ def _check_grads():
         SELECT mint, symbol, name, first_seen_ts, first_seen_mcap, velocity_score,
                v1_score, v1_pct, creator_wallet, creator_reputation
         FROM watchlist WHERE graduated=0 AND pre_scored=1
-        ORDER BY velocity_score DESC LIMIT 10
+        ORDER BY velocity_score DESC LIMIT 3
     """).fetchall()
     
     for token in watched:
@@ -1105,10 +1105,13 @@ def _classify():
 def _safe(label, fn, *args):
     """Run a function safely — log errors but never crash the loop."""
     try:
-        return fn(*args)
+        _log(f"  → {label}...")
+        result = fn(*args)
+        _log(f"  ✓ {label} done")
+        return result
     except Exception as e:
         stats["errors"] += 1
-        _log(f"ERROR [{label}]: {e}")
+        _log(f"  ✗ {label} ERROR: {e}")
         return None
 
 def main_loop():
