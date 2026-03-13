@@ -296,13 +296,14 @@ def get_creator_wallet(token_address):
 
 # ── PHASE 1: Pump.fun Pre-Graduation Monitor ───────────────────────────
 
-def _check_pumpfun(conn):
+def _check_pumpfun():
     """Watch Pump.fun for tokens approaching graduation threshold."""
     data = fetch_json(f"{PUMPFUN_API}/coins/currently-live")
     if not data or not isinstance(data, list):
         return 0
     
     stats["pumpfun_checks"] += 1
+    conn = get_db()
     now = int(time.time())
     new_watched = 0
     
@@ -344,11 +345,16 @@ def _check_pumpfun(conn):
             new_watched += 1
             stats["pre_grad_watched"] += 1
     
+    conn.commit()
+    conn.close()
+    if new_watched > 0:
+        _log(f"Pump.fun: {new_watched} new tokens on watchlist")
     return new_watched
 
 
-def _pre_score(conn):
+def _pre_score():
     """Pre-score tokens that are close to graduation but not yet scored."""
+    conn = get_db()
     
     # Get tokens at 80%+ of graduation that haven't been scored
     candidates = conn.execute("""
@@ -414,12 +420,16 @@ def _pre_score(conn):
         stats["pre_grad_scored"] += 1
         _log(f"Pre-scored {token['symbol']}: {score}pts, creator={creator_rep}")
         time.sleep(0.5)
+    
+    conn.commit()
+    conn.close()
 
 
 # ── PHASE 2: Graduation Detection ──────────────────────────────────────
 
-def _check_grads(conn):
+def _check_grads():
     """Check if any watched tokens have graduated (appear on DexScreener)."""
+    conn = get_db()
     now = int(time.time())
     
     # Get pre-scored, non-graduated tokens
@@ -524,6 +534,9 @@ def _check_grads(conn):
         
         _log(f"GRADUATED: {token['symbol']} vel={vel_rating} ({grad_time}s) score={full_score['pct'] if full_score else '?'}%")
         time.sleep(0.3)
+    
+    conn.commit()
+    conn.close()
 
 
 def do_full_score(mint, pair, conn):
@@ -813,8 +826,9 @@ def generate_watch_alert(conn, mint, pair, score_data, vel_rating):
 
 # ── PHASE 4: Exit Signal Monitor ────────────────────────────────────────
 
-def _monitor_pos(conn):
+def _monitor_pos():
     """Check active positions for exit signals."""
+    conn = get_db()
     now = int(time.time())
     
     positions = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
@@ -883,6 +897,9 @@ def _monitor_pos(conn):
             continue
         
         time.sleep(0.3)
+    
+    conn.commit()
+    conn.close()
 
 
 def generate_exit_alert(conn, pos, reason, detail):
@@ -912,10 +929,13 @@ def generate_exit_alert(conn, pos, reason, detail):
 
 # ── PHASE 5: DexScreener Discovery (backup) ────────────────────────────
 
-def _discover_dx(conn):
+def _discover_dx():
     """Backup discovery for tokens that bypass Pump.fun monitoring."""
+    conn = get_db()
     known = set(r[0] for r in conn.execute("SELECT address FROM tokens").fetchall())
     watched = set(r[0] for r in conn.execute("SELECT mint FROM watchlist").fetchall())
+    conn.close()
+    
     new_tokens = 0
     candidates = {}
     
@@ -932,7 +952,7 @@ def _discover_dx(conn):
                     if addr and addr not in known and addr not in watched:
                         candidates[addr] = name
     
-    for addr, src in list(candidates.items())[:20]:
+    for addr, src in list(candidates.items())[:10]:
         pair = get_pair_data(addr)
         if not pair:
             continue
@@ -941,7 +961,7 @@ def _discover_dx(conn):
         if dex not in ("raydium", "pumpswap", "orca") or liq < 5000:
             continue
         
-        # Record and score
+        # Record
         now = int(time.time())
         base = pair.get("baseToken", {})
         created = pair.get("pairCreatedAt", 0)
@@ -957,7 +977,8 @@ def _discover_dx(conn):
         with fear_greed_lock: fg = fear_greed_value
         now_dt = datetime.now(timezone.utc)
         
-        conn.execute("""
+        conn2 = get_db()
+        conn2.execute("""
             INSERT OR IGNORE INTO tokens
             (address, symbol, name, dex_id, pair_address, pair_created_at, source,
              detected_at, detected_ts, age_at_detection_sec,
@@ -981,17 +1002,22 @@ def _discover_dx(conn):
             get_holder_count(addr), current_sol, fg, now_dt.hour, now_dt.strftime("%A"),
             0, "UNKNOWN",
         ))
+        conn2.commit()
+        conn2.close()
         new_tokens += 1
         stats["tokens_tracked"] += 1
         time.sleep(0.25)
     
     stats["scans"] += 1
+    if new_tokens > 0:
+        _log(f"DX backup: {new_tokens} new tokens")
     return new_tokens
 
 
 # ── Snapshot Engine ─────────────────────────────────────────────────────
 
-def _take_snaps(conn):
+def _take_snaps():
+    conn = get_db()
     now = int(time.time())
     with sol_price_lock: current_sol = sol_price_usd
 
@@ -1042,11 +1068,14 @@ def _take_snaps(conn):
             conn.execute("UPDATE tokens SET peak_price=?, peak_return=?, peak_time_sec=? WHERE address=?",
                         (price, ret, elapsed, addr))
         time.sleep(0.3)
+    conn.commit()
+    conn.close()
 
 
 # ── Pattern Classification ──────────────────────────────────────────────
 
-def _classify(conn):
+def _classify():
+    conn = get_db()
     tokens = conn.execute("SELECT address FROM tokens WHERE snapshots_complete=1 AND pattern IS NULL").fetchall()
     for token in tokens:
         addr = token["address"]
@@ -1067,6 +1096,8 @@ def _classify(conn):
         else: pattern = "volatile_down"
         conn.execute("UPDATE tokens SET pattern=?, best_buy_sec=0, best_sell_sec=?, max_profit_pct=? WHERE address=?",
                      (pattern, times[best_idx], peak, addr))
+    conn.commit()
+    conn.close()
 
 
 # ── Main Loop ───────────────────────────────────────────────────────────
@@ -1086,8 +1117,6 @@ def main_loop():
     cycle = 0
     while True:
         try:
-            _log(f"Cycle {cycle} starting...")
-            
             # Update market data every ~60s
             if cycle % 4 == 0:
                 p = _safe("sol_price", get_sol_price)
@@ -1097,56 +1126,33 @@ def main_loop():
             if cycle % 40 == 0:
                 _safe("fear_greed", update_fear_greed)
             
-            # All DB work in one connection per cycle
-            conn = None
-            try:
-                conn = get_db()
-                
-                # PHASE 1: Watch Pump.fun
-                r = _safe("pumpfun", _check_pumpfun, conn)
-                if r and r > 0:
-                    _log(f"Pump.fun: {r} new tokens on watchlist")
-                
-                # PHASE 2: Pre-score (every 2 cycles = 30s)
-                if cycle % 2 == 0:
-                    _safe("pre_score", _pre_score, conn)
-                
-                # PHASE 3: Check graduations
-                _safe("graduations", _check_grads, conn)
-                
-                # PHASE 4: Exit monitoring
-                _safe("positions", _monitor_pos, conn)
-                
-                # PHASE 5: Snapshots
-                _safe("snapshots", _take_snaps, conn)
-                
-                # PHASE 6: DexScreener backup (every 4 cycles = 60s)
-                if cycle % 4 == 0:
-                    dx = _safe("dexscreener", _discover_dx, conn)
-                    if dx and dx > 0: _log(f"DX backup: {dx} new tokens")
-                
-                # Pattern classification (every 20 cycles = 5 min)
-                if cycle % 20 == 0:
-                    _safe("classify", _classify, conn)
-                
-                # Cleanup old watchlist (every 100 cycles)
-                if cycle % 100 == 0:
-                    cutoff = int(time.time()) - 3600
-                    conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
-                
-                conn.commit()
-            except Exception as e:
-                _log(f"ERROR [db_cycle]: {e}")
-                stats["errors"] += 1
-            finally:
-                if conn:
-                    try: conn.close()
-                    except: pass
+            # Each phase gets its OWN db connection — no long holds
+            _safe("pumpfun", _check_pumpfun)
             
-            _log(f"Cycle {cycle} done. Watched={stats['pre_grad_watched']} Tracked={stats['tokens_tracked']} Alerts={stats['alerts_generated']} Errors={stats['errors']}")
+            if cycle % 2 == 0:
+                _safe("pre_score", _pre_score)
+            
+            _safe("graduations", _check_grads)
+            _safe("positions", _monitor_pos)
+            _safe("snapshots", _take_snaps)
+            
+            if cycle % 4 == 0:
+                _safe("dexscreener", _discover_dx)
+            
+            if cycle % 20 == 0:
+                _safe("classify", _classify)
+            
+            if cycle % 100 == 0:
+                conn = get_db()
+                cutoff = int(time.time()) - 3600
+                conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
+                conn.commit()
+                conn.close()
+            
+            _log(f"Cycle {cycle} | W={stats['pre_grad_watched']} T={stats['tokens_tracked']} A={stats['alerts_generated']} E={stats['errors']}")
             cycle += 1
         except Exception as e:
-            _log(f"CRITICAL ERROR: {e}\n{''.join(traceback.format_exc())}")
+            _log(f"CRITICAL: {e}")
             stats["errors"] += 1
         time.sleep(15)
 
@@ -1169,14 +1175,17 @@ def _watchdog():
 
 @app.route("/")
 def index():
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
-    complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete=1").fetchone()["c"]
-    snaps = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
-    watched = conn.execute("SELECT COUNT(*) as c FROM watchlist WHERE graduated=0").fetchone()["c"]
-    pending_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE delivered=0").fetchone()["c"]
-    active_pos = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='active'").fetchone()["c"]
-    conn.close()
+    try:
+        conn = get_db()
+        total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
+        complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete=1").fetchone()["c"]
+        snaps = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
+        watched = conn.execute("SELECT COUNT(*) as c FROM watchlist WHERE graduated=0").fetchone()["c"]
+        pending_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE delivered=0").fetchone()["c"]
+        active_pos = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='active'").fetchone()["c"]
+        conn.close()
+    except Exception as e:
+        return jsonify({"status": "running", "version": "v6-sniper", "db_busy": True, "error": str(e), "stats": stats})
     with sol_price_lock: sol = sol_price_usd
     with fear_greed_lock: fg = fear_greed_value; fl = fear_greed_label
     return jsonify({
