@@ -706,7 +706,20 @@ def mark_creator_rug(creator_wallet):
 
 # ── Main Loop ───────────────────────────────────────────────────────────
 
+import traceback as _tb
+
+_log_lines = []
+def _log(msg):
+    ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    _log_lines.append(line)
+    if len(_log_lines) > 200:
+        _log_lines.pop(0)
+
 def main_loop():
+    global sol_price_usd, fear_greed_value, fear_greed_label
+    _log("main_loop STARTED")
     cycle = 0
     while True:
         try:
@@ -714,34 +727,32 @@ def main_loop():
                 p = get_sol_price()
                 if p > 0:
                     with sol_price_lock:
-                        global sol_price_usd
                         sol_price_usd = p
+                    if cycle == 0:
+                        _log(f"SOL price: ${p}")
             
-            # Update Fear & Greed every ~10 min
             if cycle % 40 == 0:
                 update_fear_greed()
 
             ws_new = process_ws_queue()
             if ws_new:
-                print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] WS: {len(ws_new)}")
+                _log(f"WS: {len(ws_new)} new")
 
             if cycle % 2 == 0:
                 dx_new = discover_dexscreener()
-                if dx_new:
-                    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] DX: {len(dx_new)}")
+                _log(f"DX scan #{scan_count}: {len(dx_new)} new tokens")
 
             take_snapshots()
 
             if cycle % 10 == 0:
                 classify_patterns()
 
-            # Save tracking data every 20 cycles (~5 min)
             if cycle % 20 == 0:
                 save_tracking_data()
 
             cycle += 1
         except Exception as e:
-            print(f"Loop error: {e}")
+            _log(f"ERROR: {e}\n{''.join(_tb.format_exc())}")
             tracker_stats["errors"] += 1
         time.sleep(15)
 
@@ -774,6 +785,10 @@ def index():
 @app.route("/health")
 def health():
     return "OK"
+
+@app.route("/logs")
+def logs():
+    return jsonify({"lines": _log_lines[-100:], "count": len(_log_lines)})
 
 @app.route("/api/graduations")
 def get_graduations():
@@ -1030,9 +1045,10 @@ def start_all():
     global _started
     if not _started:
         _started = True
-        threading.Thread(target=main_loop, daemon=True).start()
-        threading.Thread(target=helius_ws_loop, daemon=True).start()
-        print("Scanner v5 — FULL SUITE: DX + WS + momentum + holders + SOL + creators + snipers + volume velocity!")
+        _log("Starting threads...")
+        threading.Thread(target=main_loop, daemon=True, name="main_loop").start()
+        threading.Thread(target=helius_ws_loop, daemon=True, name="ws_loop").start()
+        _log("Scanner v5 STARTED — all threads launched")
 
 start_all()
 
