@@ -37,6 +37,11 @@ sol_price_usd = 0.0
 sol_price_lock = threading.Lock()
 tracker_stats = {"tracked": 0, "snapshots_taken": 0, "errors": 0, "ws_events": 0}
 
+# Fear & Greed index (updated periodically)
+fear_greed_value = 50
+fear_greed_label = "Neutral"
+fear_greed_lock = threading.Lock()
+
 SNAPSHOT_TIMES = [15, 30, 45, 60, 75, 90, 105, 120, 150, 180, 210, 240, 300, 420, 600]
 HOLDER_CHECK_TIMES = [0, 60, 180, 300, 600]
 PUMPSWAP_PROGRAM = "PSwapMdSai8tjrEXcxFeQth87xC4rRsa4VA5mhGhXkP"
@@ -88,6 +93,9 @@ def init_db():
             t0_has_socials INTEGER,
             t0_holders INTEGER,
             t0_sol_price REAL,
+            t0_fear_greed INTEGER,
+            t0_hour_utc INTEGER,
+            t0_day_of_week TEXT,
             creator_wallet TEXT,
             creator_prev_launches INTEGER DEFAULT 0,
             creator_prev_rugs INTEGER DEFAULT 0,
@@ -235,6 +243,16 @@ def get_sol_price():
                     pass
     return 0.0
 
+def update_fear_greed():
+    """Fetch crypto Fear & Greed index from alternative.me (free, no key)."""
+    global fear_greed_value, fear_greed_label
+    data = fetch_json("https://api.alternative.me/fng/?limit=1")
+    if data and data.get("data") and len(data["data"]) > 0:
+        entry = data["data"][0]
+        with fear_greed_lock:
+            fear_greed_value = int(entry.get("value", 50))
+            fear_greed_label = entry.get("value_classification", "Neutral")
+
 def get_holder_count(token_address):
     if not HELIUS_RPC:
         return None
@@ -367,6 +385,13 @@ def record_token(conn, addr, pair, source="dexscreener"):
     # Feature 4: SOL price context
     with sol_price_lock:
         current_sol = sol_price_usd
+    
+    # Features 8-10: Time analysis + Fear & Greed
+    now_dt = datetime.now(timezone.utc)
+    hour_utc = now_dt.hour
+    day_of_week = now_dt.strftime("%A")
+    with fear_greed_lock:
+        fg_value = fear_greed_value
 
     # Feature 5: Creator reputation
     creator = get_creator_wallet(addr)
@@ -387,9 +412,10 @@ def record_token(conn, addr, pair, source="dexscreener"):
          t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
          t0_price_change_m5, t0_price_change_h1, t0_has_socials,
          t0_holders, t0_sol_price,
+         t0_fear_greed, t0_hour_utc, t0_day_of_week,
          creator_wallet, creator_prev_launches, creator_prev_rugs, creator_reputation,
          early_buyers, sniper_bot_count)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         addr, base.get("symbol", "???"), base.get("name", "Unknown"),
         pair.get("dexId", ""), pair.get("pairAddress", ""), created, source,
@@ -402,6 +428,7 @@ def record_token(conn, addr, pair, source="dexscreener"):
         pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
         1 if (len(socials) > 0 or len(websites) > 0) else 0,
         holders, current_sol,
+        fg_value, hour_utc, day_of_week,
         creator, prev_launches, prev_rugs, reputation,
         early_json, bot_count,
     ))
@@ -689,6 +716,10 @@ def main_loop():
                     with sol_price_lock:
                         global sol_price_usd
                         sol_price_usd = p
+            
+            # Update Fear & Greed every ~10 min
+            if cycle % 40 == 0:
+                update_fear_greed()
 
             ws_new = process_ws_queue()
             if ws_new:
@@ -731,6 +762,7 @@ def index():
         "status": "running", "version": "v5",
         "websocket": "connected" if ws_connected else "disconnected",
         "sol_price_usd": sol,
+        "fear_greed": {"value": fear_greed_value, "label": fear_greed_label},
         "scans": scan_count, "last_scan": last_scan_time,
         "total_tracked": total, "tracked_via_ws": ws_count,
         "complete_curves": complete, "total_snapshots": snaps,
@@ -788,7 +820,7 @@ def get_graduation(address):
 @app.route("/api/curves")
 def get_curves():
     conn = get_db()
-    tokens = conn.execute("SELECT address, pattern, peak_return, peak_time_sec, creator_reputation, sniper_bot_count FROM tokens WHERE snapshots_complete=1").fetchall()
+    tokens = conn.execute("SELECT address, pattern, peak_return, peak_time_sec, creator_reputation, sniper_bot_count, t0_hour_utc, t0_day_of_week, t0_fear_greed FROM tokens WHERE snapshots_complete=1").fetchall()
     if not tokens:
         conn.close()
         return jsonify({"message": "No complete curves yet.", "total": 0})
@@ -872,6 +904,62 @@ def get_curves():
         if peaks:
             sniper_analysis[key] = {"count": len(peaks), "avg_peak": round(sum(peaks)/len(peaks), 1)}
 
+    # Feature 10: Time-of-day analysis
+    hourly_performance = {}
+    for t in tokens:
+        hour = t["t0_hour_utc"]
+        if hour is not None:
+            h = str(hour).zfill(2) + ":00"
+            if h not in hourly_performance:
+                hourly_performance[h] = {"tokens": 0, "peaks": []}
+            hourly_performance[h]["tokens"] += 1
+            hourly_performance[h]["peaks"].append(t["peak_return"] or 0)
+    for h in hourly_performance:
+        peaks = hourly_performance[h]["peaks"]
+        hourly_performance[h] = {
+            "tokens": len(peaks),
+            "avg_peak": round(sum(peaks)/len(peaks), 1),
+            "win_rate": round(sum(1 for p in peaks if p > 0)/len(peaks)*100, 1) if peaks else 0
+        }
+
+    # Feature 8: Day-of-week analysis
+    daily_performance = {}
+    for t in tokens:
+        day = t["t0_day_of_week"]
+        if day:
+            if day not in daily_performance:
+                daily_performance[day] = {"tokens": 0, "peaks": []}
+            daily_performance[day]["tokens"] += 1
+            daily_performance[day]["peaks"].append(t["peak_return"] or 0)
+    for d in daily_performance:
+        peaks = daily_performance[d]["peaks"]
+        daily_performance[d] = {
+            "tokens": len(peaks),
+            "avg_peak": round(sum(peaks)/len(peaks), 1),
+            "win_rate": round(sum(1 for p in peaks if p > 0)/len(peaks)*100, 1) if peaks else 0
+        }
+
+    # Feature 9: Fear & Greed impact
+    fg_buckets = {"extreme_fear": (0, 25), "fear": (25, 45), "neutral": (45, 55), "greed": (55, 75), "extreme_greed": (75, 100)}
+    fg_performance = {}
+    for t in tokens:
+        fg = t["t0_fear_greed"]
+        if fg is not None:
+            for label, (lo, hi) in fg_buckets.items():
+                if lo <= fg < hi:
+                    if label not in fg_performance:
+                        fg_performance[label] = {"tokens": 0, "peaks": []}
+                    fg_performance[label]["tokens"] += 1
+                    fg_performance[label]["peaks"].append(t["peak_return"] or 0)
+                    break
+    for label in fg_performance:
+        peaks = fg_performance[label]["peaks"]
+        fg_performance[label] = {
+            "tokens": len(peaks),
+            "avg_peak": round(sum(peaks)/len(peaks), 1),
+            "win_rate": round(sum(1 for p in peaks if p > 0)/len(peaks)*100, 1) if peaks else 0
+        }
+
     conn.close()
     return jsonify({
         "total_tokens_analyzed": len(tokens),
@@ -883,6 +971,9 @@ def get_curves():
         "patterns": patterns,
         "creator_reputation_impact": creator_analysis,
         "sniper_bot_impact": sniper_analysis,
+        "hourly_performance": hourly_performance,
+        "daily_performance": daily_performance,
+        "fear_greed_impact": fg_performance,
     })
 
 @app.route("/api/snipers")
