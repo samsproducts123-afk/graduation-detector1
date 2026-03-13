@@ -1071,65 +1071,98 @@ def _classify(conn):
 
 # ── Main Loop ───────────────────────────────────────────────────────────
 
+def _safe(label, fn, *args):
+    """Run a function safely — log errors but never crash the loop."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        stats["errors"] += 1
+        _log(f"ERROR [{label}]: {e}")
+        return None
+
 def main_loop():
     global sol_price_usd
     _log("=== SNIPER v6 MAIN LOOP STARTED ===")
     cycle = 0
     while True:
         try:
+            _log(f"Cycle {cycle} starting...")
+            
             # Update market data every ~60s
             if cycle % 4 == 0:
-                p = get_sol_price()
-                if p > 0:
+                p = _safe("sol_price", get_sol_price)
+                if p and p > 0:
                     with sol_price_lock: sol_price_usd = p
                     if cycle == 0: _log(f"SOL: ${p}")
             if cycle % 40 == 0:
-                update_fear_greed()
+                _safe("fear_greed", update_fear_greed)
             
-            # All DB work in one connection per cycle to avoid lock contention
-            conn = get_db()
+            # All DB work in one connection per cycle
+            conn = None
             try:
-                # PHASE 1: Watch Pump.fun for approaching graduations
-                new_watched = _check_pumpfun(conn)
-                if new_watched > 0:
-                    _log(f"Pump.fun: {new_watched} new tokens on watchlist")
+                conn = get_db()
                 
-                # PHASE 2: Pre-score tokens nearing graduation (every 2 cycles = 30s)
+                # PHASE 1: Watch Pump.fun
+                r = _safe("pumpfun", _check_pumpfun, conn)
+                if r and r > 0:
+                    _log(f"Pump.fun: {r} new tokens on watchlist")
+                
+                # PHASE 2: Pre-score (every 2 cycles = 30s)
                 if cycle % 2 == 0:
-                    _pre_score(conn)
+                    _safe("pre_score", _pre_score, conn)
                 
-                # PHASE 3: Check for graduations — SPEED IS KEY
-                _check_grads(conn)
+                # PHASE 3: Check graduations
+                _safe("graduations", _check_grads, conn)
                 
-                # PHASE 4: Monitor active positions for exit signals
-                _monitor_pos(conn)
+                # PHASE 4: Exit monitoring
+                _safe("positions", _monitor_pos, conn)
                 
-                # PHASE 5: Take price snapshots
-                _take_snaps(conn)
+                # PHASE 5: Snapshots
+                _safe("snapshots", _take_snaps, conn)
                 
-                # PHASE 6: DexScreener backup discovery (every 4 cycles = 60s)
+                # PHASE 6: DexScreener backup (every 4 cycles = 60s)
                 if cycle % 4 == 0:
-                    dx = _discover_dx(conn)
-                    if dx > 0: _log(f"DX backup: {dx} new tokens")
+                    dx = _safe("dexscreener", _discover_dx, conn)
+                    if dx and dx > 0: _log(f"DX backup: {dx} new tokens")
                 
                 # Pattern classification (every 20 cycles = 5 min)
                 if cycle % 20 == 0:
-                    _classify(conn)
+                    _safe("classify", _classify, conn)
                 
-                # Cleanup old watchlist entries (every 100 cycles)
+                # Cleanup old watchlist (every 100 cycles)
                 if cycle % 100 == 0:
                     cutoff = int(time.time()) - 3600
                     conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
                 
                 conn.commit()
+            except Exception as e:
+                _log(f"ERROR [db_cycle]: {e}")
+                stats["errors"] += 1
             finally:
-                conn.close()
+                if conn:
+                    try: conn.close()
+                    except: pass
             
+            _log(f"Cycle {cycle} done. Watched={stats['pre_grad_watched']} Tracked={stats['tokens_tracked']} Alerts={stats['alerts_generated']} Errors={stats['errors']}")
             cycle += 1
         except Exception as e:
-            _log(f"ERROR: {e}\n{''.join(traceback.format_exc())}")
+            _log(f"CRITICAL ERROR: {e}\n{''.join(traceback.format_exc())}")
             stats["errors"] += 1
         time.sleep(15)
+
+
+def _watchdog():
+    """Auto-restart main_loop if it dies."""
+    while True:
+        time.sleep(60)
+        alive = False
+        for t in threading.enumerate():
+            if t.name == "main_loop" and t.is_alive():
+                alive = True
+                break
+        if not alive:
+            _log("⚠️ WATCHDOG: main_loop died, restarting...")
+            threading.Thread(target=main_loop, daemon=True, name="main_loop").start()
 
 
 # ── API Routes ──────────────────────────────────────────────────────────
@@ -1157,7 +1190,17 @@ def index():
 
 @app.route("/health")
 def health():
-    return "OK"
+    # Verify main loop is alive
+    alive = any(t.name == "main_loop" and t.is_alive() for t in threading.enumerate())
+    if alive:
+        return "OK"
+    else:
+        return "LOOP_DEAD", 500
+
+@app.route("/api/threads")
+def threads():
+    tlist = [{"name": t.name, "alive": t.is_alive(), "daemon": t.daemon} for t in threading.enumerate()]
+    return jsonify({"threads": tlist, "count": len(tlist)})
 
 @app.route("/logs")
 def logs():
@@ -1278,6 +1321,7 @@ def start_all():
         _started = True
         _log("Starting Graduation Sniper v6...")
         threading.Thread(target=main_loop, daemon=True, name="main_loop").start()
+        threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
         _log("🎯 SNIPER v6 LIVE — Pre-graduation detection + instant alerts + exit signals")
 
 start_all()
