@@ -63,8 +63,10 @@ def _log(msg):
 # ── Database ────────────────────────────────────────────────────────────
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 def init_db():
@@ -294,14 +296,13 @@ def get_creator_wallet(token_address):
 
 # ── PHASE 1: Pump.fun Pre-Graduation Monitor ───────────────────────────
 
-def check_pumpfun_approaching():
+def _check_pumpfun(conn):
     """Watch Pump.fun for tokens approaching graduation threshold."""
     data = fetch_json(f"{PUMPFUN_API}/coins/currently-live")
     if not data or not isinstance(data, list):
         return 0
     
     stats["pumpfun_checks"] += 1
-    conn = get_db()
     now = int(time.time())
     new_watched = 0
     
@@ -343,14 +344,11 @@ def check_pumpfun_approaching():
             new_watched += 1
             stats["pre_grad_watched"] += 1
     
-    conn.commit()
-    conn.close()
     return new_watched
 
 
-def pre_score_watchlist():
+def _pre_score(conn):
     """Pre-score tokens that are close to graduation but not yet scored."""
-    conn = get_db()
     
     # Get tokens at 80%+ of graduation that haven't been scored
     candidates = conn.execute("""
@@ -416,16 +414,12 @@ def pre_score_watchlist():
         stats["pre_grad_scored"] += 1
         _log(f"Pre-scored {token['symbol']}: {score}pts, creator={creator_rep}")
         time.sleep(0.5)
-    
-    conn.commit()
-    conn.close()
 
 
 # ── PHASE 2: Graduation Detection ──────────────────────────────────────
 
-def check_graduations():
+def _check_grads(conn):
     """Check if any watched tokens have graduated (appear on DexScreener)."""
-    conn = get_db()
     now = int(time.time())
     
     # Get pre-scored, non-graduated tokens
@@ -530,9 +524,6 @@ def check_graduations():
         
         _log(f"GRADUATED: {token['symbol']} vel={vel_rating} ({grad_time}s) score={full_score['pct'] if full_score else '?'}%")
         time.sleep(0.3)
-    
-    conn.commit()
-    conn.close()
 
 
 def do_full_score(mint, pair, conn):
@@ -822,9 +813,8 @@ def generate_watch_alert(conn, mint, pair, score_data, vel_rating):
 
 # ── PHASE 4: Exit Signal Monitor ────────────────────────────────────────
 
-def monitor_positions():
+def _monitor_pos(conn):
     """Check active positions for exit signals."""
-    conn = get_db()
     now = int(time.time())
     
     positions = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
@@ -893,9 +883,6 @@ def monitor_positions():
             continue
         
         time.sleep(0.3)
-    
-    conn.commit()
-    conn.close()
 
 
 def generate_exit_alert(conn, pos, reason, detail):
@@ -925,9 +912,8 @@ def generate_exit_alert(conn, pos, reason, detail):
 
 # ── PHASE 5: DexScreener Discovery (backup) ────────────────────────────
 
-def discover_dexscreener():
+def _discover_dx(conn):
     """Backup discovery for tokens that bypass Pump.fun monitoring."""
-    conn = get_db()
     known = set(r[0] for r in conn.execute("SELECT address FROM tokens").fetchall())
     watched = set(r[0] for r in conn.execute("SELECT mint FROM watchlist").fetchall())
     new_tokens = 0
@@ -999,16 +985,13 @@ def discover_dexscreener():
         stats["tokens_tracked"] += 1
         time.sleep(0.25)
     
-    conn.commit()
-    conn.close()
     stats["scans"] += 1
     return new_tokens
 
 
 # ── Snapshot Engine ─────────────────────────────────────────────────────
 
-def take_snapshots():
-    conn = get_db()
+def _take_snaps(conn):
     now = int(time.time())
     with sol_price_lock: current_sol = sol_price_usd
 
@@ -1059,14 +1042,11 @@ def take_snapshots():
             conn.execute("UPDATE tokens SET peak_price=?, peak_return=?, peak_time_sec=? WHERE address=?",
                         (price, ret, elapsed, addr))
         time.sleep(0.3)
-    conn.commit()
-    conn.close()
 
 
 # ── Pattern Classification ──────────────────────────────────────────────
 
-def classify_patterns():
-    conn = get_db()
+def _classify(conn):
     tokens = conn.execute("SELECT address FROM tokens WHERE snapshots_complete=1 AND pattern IS NULL").fetchall()
     for token in tokens:
         addr = token["address"]
@@ -1087,8 +1067,6 @@ def classify_patterns():
         else: pattern = "volatile_down"
         conn.execute("UPDATE tokens SET pattern=?, best_buy_sec=0, best_sell_sec=?, max_profit_pct=? WHERE address=?",
                      (pattern, times[best_idx], peak, addr))
-    conn.commit()
-    conn.close()
 
 
 # ── Main Loop ───────────────────────────────────────────────────────────
@@ -1108,39 +1086,43 @@ def main_loop():
             if cycle % 40 == 0:
                 update_fear_greed()
             
-            # PHASE 1: Watch Pump.fun for approaching graduations (every cycle = 15s)
-            new_watched = check_pumpfun_approaching()
-            if new_watched > 0:
-                _log(f"Pump.fun: {new_watched} new tokens on watchlist")
-            
-            # PHASE 2: Pre-score tokens nearing graduation (every 2 cycles = 30s)
-            if cycle % 2 == 0:
-                pre_score_watchlist()
-            
-            # PHASE 3: Check for graduations (every cycle = 15s) — SPEED IS KEY
-            check_graduations()
-            
-            # PHASE 4: Monitor active positions for exit signals (every cycle)
-            monitor_positions()
-            
-            # PHASE 5: Take price snapshots
-            take_snapshots()
-            
-            # PHASE 6: DexScreener backup discovery (every 4 cycles = 60s)
-            if cycle % 4 == 0:
-                dx = discover_dexscreener()
-                if dx > 0: _log(f"DX backup: {dx} new tokens")
-            
-            # Pattern classification (every 20 cycles = 5 min)
-            if cycle % 20 == 0:
-                classify_patterns()
-            
-            # Cleanup old watchlist entries (every 100 cycles)
-            if cycle % 100 == 0:
-                conn = get_db()
-                cutoff = int(time.time()) - 3600  # Remove tokens watched > 1h that didn't graduate
-                conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
+            # All DB work in one connection per cycle to avoid lock contention
+            conn = get_db()
+            try:
+                # PHASE 1: Watch Pump.fun for approaching graduations
+                new_watched = _check_pumpfun(conn)
+                if new_watched > 0:
+                    _log(f"Pump.fun: {new_watched} new tokens on watchlist")
+                
+                # PHASE 2: Pre-score tokens nearing graduation (every 2 cycles = 30s)
+                if cycle % 2 == 0:
+                    _pre_score(conn)
+                
+                # PHASE 3: Check for graduations — SPEED IS KEY
+                _check_grads(conn)
+                
+                # PHASE 4: Monitor active positions for exit signals
+                _monitor_pos(conn)
+                
+                # PHASE 5: Take price snapshots
+                _take_snaps(conn)
+                
+                # PHASE 6: DexScreener backup discovery (every 4 cycles = 60s)
+                if cycle % 4 == 0:
+                    dx = _discover_dx(conn)
+                    if dx > 0: _log(f"DX backup: {dx} new tokens")
+                
+                # Pattern classification (every 20 cycles = 5 min)
+                if cycle % 20 == 0:
+                    _classify(conn)
+                
+                # Cleanup old watchlist entries (every 100 cycles)
+                if cycle % 100 == 0:
+                    cutoff = int(time.time()) - 3600
+                    conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
+                
                 conn.commit()
+            finally:
                 conn.close()
             
             cycle += 1
