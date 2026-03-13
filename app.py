@@ -549,9 +549,19 @@ def get_stats():
 
 init_db()
 
+# Start scanner thread at module load (works with gunicorn)
+_scanner_started = False
+
+def start_scanner():
+    global _scanner_started
+    if not _scanner_started:
+        _scanner_started = True
+        loop_thread = threading.Thread(target=main_loop, daemon=True)
+        loop_thread.start()
+        print("Scanner thread started!")
+
+start_scanner()
+
 if __name__ == "__main__":
-    loop_thread = threading.Thread(target=main_loop, daemon=True)
-    loop_thread.start()
-    
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
