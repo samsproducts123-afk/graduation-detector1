@@ -1115,30 +1115,16 @@ def _classify():
 # ── Main Loop ───────────────────────────────────────────────────────────
 
 def _safe(label, fn, *args, max_sec=30):
-    """Run a function safely with hard timeout."""
-    result = [None]
-    error = [None]
-    def _run():
-        try:
-            result[0] = fn(*args)
-        except Exception as e:
-            error[0] = e
-    
-    _log(f"  → {label}")
-    t = threading.Thread(target=_run)
-    t.start()
-    t.join(timeout=max_sec)
-    
-    if t.is_alive():
+    """Run a function safely. Simple try/except — no threads."""
+    try:
+        _log(f"  → {label}")
+        result = fn(*args)
+        _log(f"  ✓ {label}")
+        return result
+    except Exception as e:
         stats["errors"] += 1
-        _log(f"  ✗ {label} TIMEOUT ({max_sec}s)")
+        _log(f"  ✗ {label}: {e}")
         return None
-    if error[0]:
-        stats["errors"] += 1
-        _log(f"  ✗ {label}: {error[0]}")
-        return None
-    _log(f"  ✓ {label}")
-    return result[0]
 
 def main_loop():
     global sol_price_usd
@@ -1172,11 +1158,13 @@ def main_loop():
                 _safe("classify", _classify)
             
             if cycle % 100 == 0:
-                conn = get_db()
-                cutoff = int(time.time()) - 3600
-                conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
-                conn.commit()
-                conn.close()
+                try:
+                    conn = get_db()
+                    cutoff = int(time.time()) - 3600
+                    conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
+                    conn.commit()
+                    conn.close()
+                except: pass
             
             _log(f"Cycle {cycle} | W={stats['pre_grad_watched']} T={stats['tokens_tracked']} A={stats['alerts_generated']} E={stats['errors']}")
             cycle += 1
