@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Graduation Detector v2 — Full Price Curve Tracker
+Graduation Detector v3 — High-Resolution Price Curve Tracker
 
-Tracks every token from graduation (second 0) through minute 5.
-Captures price snapshots at: 0s, 30s, 1min, 2min, 3min, 5min.
-This data reveals the optimal buy/sell window.
+Tracks every token with 15-second resolution for first 2 minutes,
+then 30-second until 5 minutes. Shows FULL price movement.
+
+Data structure:
+  tokens table  → one row per token (discovery data)
+  snapshots table → one row per price check (unlimited resolution)
 
 Endpoints:
   GET /                         → Status
-  GET /api/graduations          → Recent graduates with all snapshots
-  GET /api/graduations/{addr}   → Single token full curve
-  GET /api/curves               → Aggregated buy/sell timing analysis
+  GET /api/graduations          → Recent graduates with full snapshot curves
+  GET /api/graduations/{addr}   → Single token with every price point
+  GET /api/curves               → Aggregated optimal buy/sell analysis
   GET /api/stats                → Scanner stats
+  GET /health                   → Health check
 """
 
 import os
@@ -33,7 +37,9 @@ last_scan_time = None
 tracker_stats = {"tracked": 0, "snapshots_taken": 0, "errors": 0}
 
 # Snapshot schedule: seconds after detection
-SNAPSHOT_SCHEDULE = [30, 60, 120, 180, 300]  # 30s, 1m, 2m, 3m, 5m
+# Every 15s for first 2 min, then every 30s until 5 min, then 1m until 10m
+SNAPSHOT_TIMES = [15, 30, 45, 60, 75, 90, 105, 120, 150, 180, 210, 240, 300, 420, 600]
+SNAPSHOT_TOLERANCE = 10  # seconds tolerance for scheduling
 
 
 # ── Database ────────────────────────────────────────────────────────────
@@ -74,36 +80,45 @@ def init_db():
             t0_price_change_m5 REAL,
             t0_price_change_h1 REAL,
             t0_has_socials INTEGER,
-            t0_boost_amount INTEGER,
             
-            -- Snapshots at intervals
-            t30s_ts INTEGER, t30s_price TEXT, t30s_liq REAL, t30s_vol_m5 REAL, t30s_buys_m5 INTEGER, t30s_sells_m5 INTEGER,
-            t1m_ts INTEGER, t1m_price TEXT, t1m_liq REAL, t1m_vol_m5 REAL, t1m_buys_m5 INTEGER, t1m_sells_m5 INTEGER,
-            t2m_ts INTEGER, t2m_price TEXT, t2m_liq REAL, t2m_vol_m5 REAL, t2m_buys_m5 INTEGER, t2m_sells_m5 INTEGER,
-            t3m_ts INTEGER, t3m_price TEXT, t3m_liq REAL, t3m_vol_m5 REAL, t3m_buys_m5 INTEGER, t3m_sells_m5 INTEGER,
-            t5m_ts INTEGER, t5m_price TEXT, t5m_liq REAL, t5m_vol_m5 REAL, t5m_buys_m5 INTEGER, t5m_sells_m5 INTEGER,
-            
-            -- Computed returns at each interval
-            return_30s REAL,
-            return_1m REAL,
-            return_2m REAL,
-            return_3m REAL,
-            return_5m REAL,
-            
-            -- Peak tracking
+            -- Peak tracking (updated with each snapshot)
             peak_price TEXT,
             peak_return REAL,
             peak_time_sec REAL,
             
-            -- Classification (filled later by analysis)
-            pattern TEXT,  -- 'rocket', 'pump_dump', 'slow_climb', 'flat', 'rug'
+            -- Final computed values (after all snapshots done)
+            pattern TEXT,
             best_buy_sec REAL,
             best_sell_sec REAL,
-            max_profit_pct REAL
+            max_profit_pct REAL,
+            snapshots_complete INTEGER DEFAULT 0
+        );
+        
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_address TEXT NOT NULL,
+            target_sec INTEGER NOT NULL,
+            actual_sec REAL NOT NULL,
+            taken_at INTEGER NOT NULL,
+            
+            price TEXT,
+            liq REAL,
+            vol_m5 REAL,
+            buys_m5 INTEGER,
+            sells_m5 INTEGER,
+            fdv REAL,
+            
+            return_pct REAL,
+            liq_change_pct REAL,
+            
+            FOREIGN KEY (token_address) REFERENCES tokens(address),
+            UNIQUE(token_address, target_sec)
         );
         
         CREATE INDEX IF NOT EXISTS idx_tokens_detected ON tokens(detected_ts);
-        CREATE INDEX IF NOT EXISTS idx_tokens_pending ON tokens(t30s_ts, t1m_ts, t2m_ts, t3m_ts, t5m_ts);
+        CREATE INDEX IF NOT EXISTS idx_tokens_incomplete ON tokens(snapshots_complete);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_token ON snapshots(token_address);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_pending ON snapshots(token_address, target_sec);
     """)
     conn.commit()
     conn.close()
@@ -113,7 +128,7 @@ def init_db():
 
 def fetch_json(url, timeout=8):
     try:
-        req = Request(url, headers={"User-Agent": "GradDetector/2.0"})
+        req = Request(url, headers={"User-Agent": "GradDetector/3.0"})
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
@@ -122,7 +137,6 @@ def fetch_json(url, timeout=8):
 
 
 def get_pair_data(address):
-    """Fetch current pair data for a token."""
     data = fetch_json(f"{DEXSCREENER_BASE}/token-pairs/v1/solana/{address}")
     if not data or not isinstance(data, list) or len(data) == 0:
         return None
@@ -140,17 +154,16 @@ def calc_return(initial_price, current_price):
     return None
 
 
-# ── Discovery Loop ──────────────────────────────────────────────────────
+# ── Discovery ───────────────────────────────────────────────────────────
 
 def discover_new_tokens():
-    """Find new graduated tokens from multiple sources."""
     global scan_count, last_scan_time
     
     conn = get_db()
     known = set(r[0] for r in conn.execute("SELECT address FROM tokens").fetchall())
     new_tokens = []
-    candidates = {}  # address -> source
-    
+    candidates = {}
+
     # Source 1: Latest profiles
     profiles = fetch_json(f"{DEXSCREENER_BASE}/token-profiles/latest/v1")
     if profiles and isinstance(profiles, list):
@@ -159,7 +172,7 @@ def discover_new_tokens():
                 addr = p.get("tokenAddress", "")
                 if addr and addr not in known:
                     candidates[addr] = "profiles"
-    
+
     # Source 2: Latest boosts
     boosts = fetch_json(f"{DEXSCREENER_BASE}/token-boosts/latest/v1")
     if boosts and isinstance(boosts, list):
@@ -167,8 +180,8 @@ def discover_new_tokens():
             if b.get("chainId") == "solana":
                 addr = b.get("tokenAddress", "")
                 if addr and addr not in known:
-                    candidates[addr] = f"boost({b.get('amount', 0)})"
-    
+                    candidates[addr] = "boost"
+
     # Source 3: Top boosts
     top_boosts = fetch_json(f"{DEXSCREENER_BASE}/token-boosts/top/v1")
     if top_boosts and isinstance(top_boosts, list):
@@ -176,10 +189,10 @@ def discover_new_tokens():
             if b.get("chainId") == "solana":
                 addr = b.get("tokenAddress", "")
                 if addr and addr not in known:
-                    candidates[addr] = f"top_boost({b.get('totalAmount', 0)})"
-    
-    # Check each candidate for graduation
-    for addr, source in list(candidates.items())[:40]:  # Max 40 per scan
+                    candidates[addr] = "top_boost"
+
+    # Check each candidate
+    for addr, source in list(candidates.items())[:40]:
         if addr in known:
             continue
         
@@ -191,7 +204,6 @@ def discover_new_tokens():
         dex = pair.get("dexId", "")
         created = pair.get("pairCreatedAt", 0)
         
-        # Must be graduated with real liquidity
         if dex not in ("raydium", "pumpswap", "orca"):
             continue
         if liq < 5000:
@@ -208,16 +220,14 @@ def discover_new_tokens():
         socials = info.get("socials", []) or []
         websites = info.get("websites", []) or []
         
-        # Record birth
         conn.execute("""
             INSERT OR IGNORE INTO tokens
             (address, symbol, name, dex_id, pair_address, pair_created_at,
              detected_at, detected_ts, age_at_detection_sec,
              t0_price, t0_liq, t0_vol_24h, t0_vol_h1, t0_vol_m5, t0_fdv, t0_mcap,
              t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
-             t0_price_change_m5, t0_price_change_h1,
-             t0_has_socials, t0_boost_amount)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             t0_price_change_m5, t0_price_change_h1, t0_has_socials)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             addr, base.get("symbol", "???"), base.get("name", "Unknown"),
             dex, pair.get("pairAddress", ""), created,
@@ -231,7 +241,6 @@ def discover_new_tokens():
             (txns.get("h1") or {}).get("sells", 0),
             pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
             1 if (len(socials) > 0 or len(websites) > 0) else 0,
-            0,
         ))
         
         known.add(addr)
@@ -249,76 +258,82 @@ def discover_new_tokens():
     return new_tokens
 
 
-# ── Snapshot Loop ───────────────────────────────────────────────────────
+# ── Snapshot Engine ─────────────────────────────────────────────────────
 
 def take_snapshots():
-    """Check back on recently discovered tokens at scheduled intervals."""
+    """Check all tokens that need snapshots at any scheduled time."""
     conn = get_db()
     now = int(time.time())
     
-    # Find tokens needing snapshots
-    snapshots_config = [
-        ("t30s", 30, 45),    # target 30s, max 45s
-        ("t1m", 60, 90),
-        ("t2m", 120, 180),
-        ("t3m", 180, 270),
-        ("t5m", 300, 450),
-    ]
+    # Get tokens still being tracked (not all snapshots done)
+    tokens = conn.execute("""
+        SELECT address, detected_ts, t0_price, t0_liq, peak_return
+        FROM tokens
+        WHERE snapshots_complete = 0
+          AND (? - detected_ts) <= 700
+        ORDER BY detected_ts DESC
+    """, (now,)).fetchall()
     
-    for prefix, target_sec, max_sec in snapshots_config:
-        col_ts = f"{prefix}_ts"
-        col_price = f"{prefix}_price"
+    for token in tokens:
+        addr = token["address"]
+        detected = token["detected_ts"]
+        t0_price = token["t0_price"]
+        t0_liq = token["t0_liq"]
+        elapsed = now - detected
         
-        # Tokens where this snapshot is due but not taken
-        rows = conn.execute(f"""
-            SELECT address, detected_ts, t0_price
-            FROM tokens
-            WHERE {col_ts} IS NULL
-              AND (? - detected_ts) >= ?
-              AND (? - detected_ts) <= ?
-            ORDER BY detected_ts DESC
-            LIMIT 10
-        """, (now, target_sec, now, max_sec)).fetchall()
+        # Find which snapshots are due but not taken
+        existing = set(r[0] for r in conn.execute(
+            "SELECT target_sec FROM snapshots WHERE token_address = ?", (addr,)
+        ).fetchall())
         
-        for row in rows:
-            addr = row["address"]
-            t0_price = row["t0_price"]
-            
-            pair = get_pair_data(addr)
-            if not pair:
+        due_snapshots = []
+        for target in SNAPSHOT_TIMES:
+            if target in existing:
                 continue
-            
-            price = pair.get("priceUsd", "0")
-            liq = (pair.get("liquidity") or {}).get("usd", 0)
-            vol_m5 = (pair.get("volume") or {}).get("m5", 0)
-            buys_m5 = (pair.get("txns", {}).get("m5") or {}).get("buys", 0)
-            sells_m5 = (pair.get("txns", {}).get("m5") or {}).get("sells", 0)
-            ret = calc_return(t0_price, price)
-            
-            return_col = f"return_{prefix.replace('t', '').replace('s', 's').replace('m', 'm')}"
-            # Map prefix to return column name
-            ret_map = {"t30s": "return_30s", "t1m": "return_1m", "t2m": "return_2m", "t3m": "return_3m", "t5m": "return_5m"}
-            
-            conn.execute(f"""
-                UPDATE tokens SET
-                    {col_ts} = ?, {col_price} = ?, {prefix}_liq = ?,
-                    {prefix}_vol_m5 = ?, {prefix}_buys_m5 = ?, {prefix}_sells_m5 = ?,
-                    {ret_map[prefix]} = ?
-                WHERE address = ?
-            """, (now, price, liq, vol_m5, buys_m5, sells_m5, ret, addr))
-            
-            # Update peak
-            if ret is not None:
-                current_peak = conn.execute("SELECT peak_return FROM tokens WHERE address = ?", (addr,)).fetchone()
-                if current_peak and (current_peak["peak_return"] is None or ret > (current_peak["peak_return"] or -999)):
-                    elapsed = now - row["detected_ts"]
-                    conn.execute("""
-                        UPDATE tokens SET peak_price = ?, peak_return = ?, peak_time_sec = ?
-                        WHERE address = ?
-                    """, (price, ret, elapsed, addr))
-            
+            if elapsed >= target and elapsed <= target + 60:  # Due and not too late
+                due_snapshots.append(target)
+        
+        if not due_snapshots:
+            # Check if all snapshots are done
+            if elapsed > max(SNAPSHOT_TIMES) + 60:
+                conn.execute("UPDATE tokens SET snapshots_complete = 1 WHERE address = ?", (addr,))
+            continue
+        
+        # Fetch current price (one API call per token, covers all due snapshots)
+        pair = get_pair_data(addr)
+        if not pair:
+            continue
+        
+        price = pair.get("priceUsd", "0")
+        liq = (pair.get("liquidity") or {}).get("usd", 0)
+        vol_m5 = (pair.get("volume") or {}).get("m5", 0)
+        buys_m5 = (pair.get("txns", {}).get("m5") or {}).get("buys", 0)
+        sells_m5 = (pair.get("txns", {}).get("m5") or {}).get("sells", 0)
+        fdv = pair.get("fdv", 0)
+        
+        ret = calc_return(t0_price, price)
+        liq_change = round((liq - t0_liq) / t0_liq * 100, 2) if t0_liq > 0 else 0
+        
+        # Insert snapshot for each due time
+        for target in due_snapshots:
+            conn.execute("""
+                INSERT OR IGNORE INTO snapshots
+                (token_address, target_sec, actual_sec, taken_at, price, liq, vol_m5,
+                 buys_m5, sells_m5, fdv, return_pct, liq_change_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (addr, target, elapsed, now, price, liq, vol_m5, buys_m5, sells_m5, fdv, ret, liq_change))
             tracker_stats["snapshots_taken"] += 1
-            time.sleep(0.3)
+        
+        # Update peak
+        if ret is not None:
+            current_peak = token["peak_return"]
+            if current_peak is None or ret > current_peak:
+                conn.execute("""
+                    UPDATE tokens SET peak_price = ?, peak_return = ?, peak_time_sec = ?
+                    WHERE address = ?
+                """, (price, ret, elapsed, addr))
+        
+        time.sleep(0.3)
     
     conn.commit()
     conn.close()
@@ -327,44 +342,54 @@ def take_snapshots():
 # ── Pattern Classification ──────────────────────────────────────────────
 
 def classify_patterns():
-    """Classify token price patterns after 5-min data is complete."""
     conn = get_db()
     
-    rows = conn.execute("""
-        SELECT address, return_30s, return_1m, return_2m, return_3m, return_5m, peak_return
-        FROM tokens
-        WHERE t5m_ts IS NOT NULL AND pattern IS NULL
+    tokens = conn.execute("""
+        SELECT address, t0_price FROM tokens
+        WHERE snapshots_complete = 1 AND pattern IS NULL
     """).fetchall()
     
-    for row in rows:
-        returns = [row["return_30s"] or 0, row["return_1m"] or 0, row["return_2m"] or 0, row["return_3m"] or 0, row["return_5m"] or 0]
-        peak = row["peak_return"] or 0
+    for token in tokens:
+        addr = token["address"]
+        snaps = conn.execute("""
+            SELECT target_sec, return_pct FROM snapshots
+            WHERE token_address = ? ORDER BY target_sec
+        """, (addr,)).fetchall()
+        
+        if len(snaps) < 5:
+            conn.execute("UPDATE tokens SET pattern = 'insufficient_data' WHERE address = ?", (addr,))
+            continue
+        
+        returns = [s["return_pct"] or 0 for s in snaps]
+        times = [s["target_sec"] for s in snaps]
+        peak = max(returns)
+        peak_time = times[returns.index(peak)]
         final = returns[-1]
         
-        # Find best buy/sell points
-        best_buy_idx = 0  # Always at detection
+        # Find optimal buy/sell
         best_sell_idx = returns.index(max(returns))
-        time_map = [30, 60, 120, 180, 300]
-        max_profit = max(returns) - 0  # Buy at t0, sell at peak
+        max_profit = peak  # Buy at t0, sell at peak
         
-        # Classify
+        # Classify pattern
         if peak > 50 and final < peak * 0.3:
             pattern = "pump_dump"
-        elif all(r > returns[i-1] if i > 0 else True for i, r in enumerate(returns)) and final > 20:
+        elif len(returns) >= 3 and all(returns[i] >= returns[i-1] - 2 for i in range(1, min(6, len(returns)))) and final > 20:
             pattern = "rocket"
         elif final > 10:
             pattern = "slow_climb"
         elif final < -30:
             pattern = "rug"
-        elif abs(final) < 10:
+        elif abs(final) < 5:
             pattern = "flat"
+        elif peak > 20 and final > 0:
+            pattern = "volatile_up"
         else:
-            pattern = "volatile"
+            pattern = "volatile_down"
         
         conn.execute("""
             UPDATE tokens SET pattern = ?, best_buy_sec = 0, best_sell_sec = ?, max_profit_pct = ?
             WHERE address = ?
-        """, (pattern, time_map[best_sell_idx] if best_sell_idx < len(time_map) else 0, max_profit, row["address"]))
+        """, (pattern, times[best_sell_idx], max_profit, addr))
     
     conn.commit()
     conn.close()
@@ -373,20 +398,16 @@ def classify_patterns():
 # ── Main Loop ───────────────────────────────────────────────────────────
 
 def main_loop():
-    """Background: discover every 30s, snapshot continuously."""
     cycle = 0
     while True:
         try:
-            # Discover new tokens every cycle
             new = discover_new_tokens()
             if new:
                 syms = ", ".join(f"{t['symbol']}({t['age_sec']:.0f}s)" for t in new[:5])
                 print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] NEW: {len(new)} — {syms}")
             
-            # Take snapshots for tracked tokens
             take_snapshots()
             
-            # Classify patterns every 10 cycles
             if cycle % 10 == 0:
                 classify_patterns()
             
@@ -395,7 +416,7 @@ def main_loop():
             print(f"Loop error: {e}")
             tracker_stats["errors"] += 1
         
-        time.sleep(30)
+        time.sleep(15)  # Run every 15 seconds for high resolution
 
 
 # ── API Routes ──────────────────────────────────────────────────────────
@@ -404,14 +425,16 @@ def main_loop():
 def index():
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
-    with_5m = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE t5m_ts IS NOT NULL").fetchone()["c"]
+    complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete = 1").fetchone()["c"]
+    snap_count = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
     conn.close()
     return jsonify({
         "status": "running",
         "scans": scan_count,
         "last_scan": last_scan_time,
         "total_tracked": total,
-        "with_full_curve": with_5m,
+        "with_complete_curves": complete,
+        "total_snapshots": snap_count,
         "stats": tracker_stats,
     })
 
@@ -426,99 +449,131 @@ def get_graduations():
     conn = get_db()
     since = flask_request.args.get("since", type=int, default=0)
     limit = flask_request.args.get("limit", type=int, default=50)
-    max_age = flask_request.args.get("max_age_min", type=int, default=30)
+    max_age = flask_request.args.get("max_age_min", type=int, default=60)
     
     now = int(time.time())
     cutoff = max(since, now - max_age * 60)
     
-    rows = conn.execute("""
+    tokens = conn.execute("""
         SELECT address, symbol, name, dex_id, detected_at, detected_ts, age_at_detection_sec,
                t0_price, t0_liq, t0_vol_24h, t0_fdv,
-               t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
-               t0_has_socials, t0_boost_amount,
-               return_30s, return_1m, return_2m, return_3m, return_5m,
-               peak_return, peak_time_sec, pattern, max_profit_pct
+               peak_return, peak_time_sec, pattern, max_profit_pct, snapshots_complete
         FROM tokens
         WHERE detected_ts >= ?
         ORDER BY detected_ts DESC
         LIMIT ?
     """, (cutoff, limit)).fetchall()
     
-    results = [dict(r) for r in rows]
-    conn.close()
+    results = []
+    for t in tokens:
+        token = dict(t)
+        # Attach all snapshots as a price curve
+        snaps = conn.execute("""
+            SELECT target_sec, actual_sec, price, liq, vol_m5, buys_m5, sells_m5, return_pct, liq_change_pct
+            FROM snapshots WHERE token_address = ? ORDER BY target_sec
+        """, (t["address"],)).fetchall()
+        token["curve"] = [dict(s) for s in snaps]
+        results.append(token)
     
+    conn.close()
     return jsonify({"count": len(results), "graduations": results})
 
 
 @app.route("/api/graduations/<address>")
 def get_graduation(address):
     conn = get_db()
-    row = conn.execute("SELECT * FROM tokens WHERE address = ?", (address,)).fetchone()
-    conn.close()
-    if not row:
+    token = conn.execute("SELECT * FROM tokens WHERE address = ?", (address,)).fetchone()
+    if not token:
+        conn.close()
         return jsonify({"error": "not found"}), 404
-    return jsonify(dict(row))
+    
+    result = dict(token)
+    snaps = conn.execute("""
+        SELECT target_sec, actual_sec, price, liq, vol_m5, buys_m5, sells_m5, fdv, return_pct, liq_change_pct
+        FROM snapshots WHERE token_address = ? ORDER BY target_sec
+    """, (address,)).fetchall()
+    result["curve"] = [dict(s) for s in snaps]
+    
+    conn.close()
+    return jsonify(result)
 
 
 @app.route("/api/curves")
 def get_curves():
-    """Aggregated analysis: when to buy, when to sell."""
+    """THE GOLD MINE: aggregated price curves showing optimal buy/sell timing."""
     conn = get_db()
     
-    # Only analyze tokens with full 5-min data
-    rows = conn.execute("""
-        SELECT return_30s, return_1m, return_2m, return_3m, return_5m,
-               peak_return, peak_time_sec, pattern, max_profit_pct,
-               t0_liq, t0_vol_24h, t0_buys_m5, t0_has_socials
-        FROM tokens
-        WHERE t5m_ts IS NOT NULL
+    # Get all complete tokens
+    tokens = conn.execute("""
+        SELECT address, t0_price, t0_liq, pattern, peak_return, peak_time_sec
+        FROM tokens WHERE snapshots_complete = 1
     """).fetchall()
     
-    if not rows:
+    if not tokens:
         conn.close()
-        return jsonify({"message": "No complete curves yet. Data collecting...", "total": 0})
+        return jsonify({"message": "No complete curves yet. Need ~10 min of data collection.", "total": 0})
     
-    total = len(rows)
+    # Build aggregated curves per target_sec
+    time_buckets = {}
+    for target in SNAPSHOT_TIMES:
+        rows = conn.execute("""
+            SELECT return_pct FROM snapshots
+            WHERE target_sec = ? AND return_pct IS NOT NULL
+        """, (target,)).fetchall()
+        
+        if rows:
+            returns = [r["return_pct"] for r in rows]
+            winners = [r for r in returns if r > 0]
+            losers = [r for r in returns if r <= 0]
+            time_buckets[f"{target}s"] = {
+                "tokens": len(returns),
+                "avg_return": round(sum(returns) / len(returns), 2),
+                "median_return": round(sorted(returns)[len(returns)//2], 2),
+                "win_rate": round(len(winners) / len(returns) * 100, 1),
+                "avg_winner": round(sum(winners) / len(winners), 2) if winners else 0,
+                "avg_loser": round(sum(losers) / len(losers), 2) if losers else 0,
+                "best": round(max(returns), 2),
+                "worst": round(min(returns), 2),
+            }
     
-    # Average returns at each interval
-    avg = lambda col: sum(r[col] or 0 for r in rows) / total
+    # Find optimal entry/exit
+    if time_buckets:
+        best_exit = max(time_buckets.items(), key=lambda x: x[1]["avg_return"])
+        best_wr = max(time_buckets.items(), key=lambda x: x[1]["win_rate"])
+    else:
+        best_exit = ("?", {})
+        best_wr = ("?", {})
     
-    # Win rates at each interval
-    wr = lambda col: sum(1 for r in rows if (r[col] or 0) > 0) / total * 100
-    
-    # By pattern
+    # Pattern breakdown
     patterns = {}
-    for r in rows:
-        p = r["pattern"] or "unknown"
+    for t in tokens:
+        p = t["pattern"] or "unknown"
         if p not in patterns:
-            patterns[p] = {"count": 0, "avg_peak": 0, "avg_5m": 0}
+            patterns[p] = {"count": 0, "avg_peak": 0, "peaks": []}
         patterns[p]["count"] += 1
-        patterns[p]["avg_peak"] += r["peak_return"] or 0
-        patterns[p]["avg_5m"] += r["return_5m"] or 0
-    
+        patterns[p]["peaks"].append(t["peak_return"] or 0)
     for p in patterns:
-        c = patterns[p]["count"]
-        patterns[p]["avg_peak"] = round(patterns[p]["avg_peak"] / c, 1)
-        patterns[p]["avg_5m"] = round(patterns[p]["avg_5m"] / c, 1)
+        peaks = patterns[p]["peaks"]
+        patterns[p]["avg_peak"] = round(sum(peaks) / len(peaks), 1)
+        patterns[p]["avg_peak_time"] = "N/A"
+        del patterns[p]["peaks"]
     
-    # Optimal timing
-    intervals = ["30s", "1m", "2m", "3m", "5m"]
-    cols = ["return_30s", "return_1m", "return_2m", "return_3m", "return_5m"]
-    
-    curve = {intervals[i]: {"avg_return": round(avg(cols[i]), 2), "win_rate": round(wr(cols[i]), 1)} for i in range(5)}
-    
-    # Best sell point (highest average return)
-    best_sell = max(curve.items(), key=lambda x: x[1]["avg_return"])
-    
+    total = len(tokens)
     conn.close()
     
     return jsonify({
         "total_tokens_analyzed": total,
-        "price_curve": curve,
-        "optimal_sell_point": best_sell[0],
-        "optimal_sell_avg_return": best_sell[1]["avg_return"],
+        "price_curve_by_time": time_buckets,
+        "optimal_exit": {
+            "by_avg_return": best_exit[0],
+            "avg_return": best_exit[1].get("avg_return", 0),
+        },
+        "optimal_entry": {
+            "by_win_rate": best_wr[0],
+            "win_rate": best_wr[1].get("win_rate", 0),
+        },
         "patterns": patterns,
-        "insight": f"Based on {total} tokens: best average exit at {best_sell[0]} ({best_sell[1]['avg_return']:+.1f}%, {best_sell[1]['win_rate']:.0f}% win rate)"
+        "insight": f"Based on {total} tokens with full curves. Best avg exit: {best_exit[0]}. Best win rate: {best_wr[0]} ({best_wr[1].get('win_rate', 0)}%)"
     })
 
 
@@ -526,21 +581,24 @@ def get_curves():
 def get_stats():
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
-    with_30s = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE t30s_ts IS NOT NULL").fetchone()["c"]
-    with_5m = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE t5m_ts IS NOT NULL").fetchone()["c"]
+    complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete = 1").fetchone()["c"]
+    snap_count = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
     classified = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE pattern IS NOT NULL").fetchone()["c"]
     
-    patterns = dict(conn.execute("SELECT pattern, COUNT(*) FROM tokens WHERE pattern IS NOT NULL GROUP BY pattern").fetchall())
+    patterns = {}
+    for row in conn.execute("SELECT pattern, COUNT(*) as c FROM tokens WHERE pattern IS NOT NULL GROUP BY pattern").fetchall():
+        patterns[row["pattern"]] = row["c"]
     
     conn.close()
     return jsonify({
         "scans": scan_count,
         "last_scan": last_scan_time,
         "total_tracked": total,
-        "with_30s_data": with_30s,
-        "with_full_5m_curve": with_5m,
+        "with_complete_curves": complete,
+        "total_snapshots": snap_count,
         "classified": classified,
         "patterns": patterns,
+        "snapshot_schedule": SNAPSHOT_TIMES,
         "tracker": tracker_stats,
     })
 
@@ -549,16 +607,14 @@ def get_stats():
 
 init_db()
 
-# Start scanner thread at module load (works with gunicorn)
 _scanner_started = False
-
 def start_scanner():
     global _scanner_started
     if not _scanner_started:
         _scanner_started = True
         loop_thread = threading.Thread(target=main_loop, daemon=True)
         loop_thread.start()
-        print("Scanner thread started!")
+        print("Scanner v3 started — 15s resolution tracking!")
 
 start_scanner()
 
