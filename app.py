@@ -28,6 +28,7 @@ PUMP_GRADUATED_URL = "https://frontend-api-v3.pump.fun/coins?limit=50&sort=creat
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+GECKOTERMINAL_NEW_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
 COINGECKO_SOL_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{address}/report/summary"
 FNG_URL = "https://api.alternative.me/fng/?limit=1"
@@ -539,67 +540,77 @@ def scan_graduated():
     return new_grads
 
 def scan_dexscreener_new():
-    """Scan DexScreener profiles + boosts for NEW tokens across ALL DEXes (Meteora, Raydium, etc).
+    """Scan GeckoTerminal for ALL new Solana pools across ALL DEXes.
+    Catches Meteora, Raydium, PumpSwap, Orca — everything Photon shows.
     Returns list of (address, symbol, name, data_dict) for tokens not already known."""
-    new_tokens = []
-    seen_addrs = set()
-
-    for url in [DEXSCREENER_PROFILES_URL, DEXSCREENER_BOOSTS_URL]:
-        try:
-            data = fetch_json(url)
-            if not data or not isinstance(data, list):
-                continue
-            for item in data:
-                if item.get("chainId") != "solana":
-                    continue
-                addr = item.get("tokenAddress", "")
-                if not addr or addr in known_graduated or addr in seen_addrs:
-                    continue
-                seen_addrs.add(addr)
-                # We'll check if this is a new token by querying DexScreener for its pair age
-                new_tokens.append(addr)
-        except Exception as e:
-            log.warning(f"DexScreener new scan error: {e}")
-
-    if not new_tokens:
-        return []
-
-    # Batch query to get pair data and filter for tokens < 15 min old
-    pairs = batch_get_pairs(new_tokens[:30])
     new_grads = []
-    now = time.time()
 
-    for addr, pair in pairs.items():
-        if addr in known_graduated:
-            continue
-        created = pair.get("pairCreatedAt", 0)
-        created_sec = created / 1000 if created > 1e12 else created
-        age_sec = now - created_sec if created_sec else 99999
+    try:
+        data = fetch_json(GECKOTERMINAL_NEW_POOLS)
+        if not data or not isinstance(data, dict):
+            return []
+        pools = data.get("data") or []
+        now = time.time()
 
-        # Only track tokens less than 15 minutes old
-        if age_sec > 900:
-            continue
+        for pool in pools:
+            try:
+                attrs = pool.get("attributes") or {}
+                rels = pool.get("relationships") or {}
 
-        sym = pair.get("baseToken", {}).get("symbol", "???")
-        name = pair.get("baseToken", {}).get("name", "")
-        dex = pair.get("dexId", "unknown")
-        known_graduated.add(addr)
+                # Get DEX type
+                dex_id = (rels.get("dex", {}).get("data", {}).get("id", "") or "").lower()
 
-        pg = {
-            "symbol": sym, "name": name, "mcap": 0,
-            "num_participants": 0, "reply_count": 0,
-            "curve_pct": 100.0, "velocity": 0,
-            "first_seen": now, "last_seen": now,
-            "creator": "", "ath_market_cap": 0,
-            "created_timestamp": created,
-            "website": "", "twitter": "", "telegram": "",
-            "source_dex": dex,  # Track which DEX this came from
-        }
-        new_grads.append((addr, sym, name, pg))
+                # Skip pump-fun bonding curve pools (not graduated yet)
+                if dex_id == "pump-fun":
+                    continue
+
+                # Get token address from base_token relationship
+                base_token_id = rels.get("base_token", {}).get("data", {}).get("id", "")
+                addr = base_token_id.replace("solana_", "") if base_token_id.startswith("solana_") else base_token_id
+                if not addr or addr in known_graduated:
+                    continue
+
+                # Get pool name (e.g. "IRR / SOL")
+                pool_name = attrs.get("name", "???")
+                parts = pool_name.split(" / ")
+                sym = parts[0].strip() if parts else "???"
+                name = sym
+
+                # Get creation time
+                created_str = attrs.get("pool_created_at", "")
+                created_ts = 0
+                if created_str:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        created_ts = int(dt.timestamp() * 1000)
+                    except:
+                        pass
+
+                known_graduated.add(addr)
+                pg = {
+                    "symbol": sym, "name": name, "mcap": 0,
+                    "num_participants": 0, "reply_count": 0,
+                    "curve_pct": 100.0, "velocity": 0,
+                    "first_seen": now, "last_seen": now,
+                    "creator": "", "ath_market_cap": 0,
+                    "created_timestamp": created_ts,
+                    "website": "", "twitter": "", "telegram": "",
+                    "source_dex": dex_id,
+                }
+                new_grads.append((addr, sym, name, pg))
+            except Exception as e:
+                log.warning(f"GeckoTerminal pool parse error: {e}")
+
+    except Exception as e:
+        log.warning(f"GeckoTerminal scan error: {e}")
 
     if new_grads:
-        dexes = set(pg.get("source_dex", "?") for _, _, _, pg in new_grads)
-        log.info(f"🌐 DexScreener scan found {len(new_grads)} NEW tokens from {dexes}")
+        dexes = {}
+        for _, _, _, pg in new_grads:
+            d = pg.get("source_dex", "?")
+            dexes[d] = dexes.get(d, 0) + 1
+        log.info(f"🌐 GeckoTerminal: {len(new_grads)} NEW tokens — {dexes}")
     return new_grads
 
 def register_graduation(address, symbol, name, pre_data):
@@ -698,14 +709,14 @@ def main_loop():
         except Exception as e:
             log.error(f"Graduated scan error: {e}\n{traceback.format_exc()}")
 
-        # ── Section 1c: DexScreener profiles/boosts for Meteora/Raydium (every 2nd tick ≈ 6 sec) ──
-        if tick % 2 == 1:
+        # ── Section 1c: GeckoTerminal ALL DEXes scan (every 10 ticks ≈ 30 sec, matches cache) ──
+        if tick % 10 == 5:
             try:
                 new_tokens = scan_dexscreener_new()
                 for addr, sym, name, pg in new_tokens:
                     register_graduation(addr, sym, name, pg)
             except Exception as e:
-                log.error(f"DexScreener new scan error: {e}\n{traceback.format_exc()}")
+                log.error(f"GeckoTerminal scan error: {e}\n{traceback.format_exc()}")
 
         # ── Section 2: First-minute tokens (BATCH DexScreener every tick ≈ 3 sec) ──
         try:
