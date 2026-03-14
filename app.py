@@ -261,24 +261,12 @@ def calc_return(initial_price, current_price):
         return None
 
 def get_sol_price():
-    # Non-blocking: run in thread with hard 4s kill
-    result = [0.0]
-    def _fetch():
-        try:
-            data = fetch_json(f"{DEXSCREENER_BASE}/token-pairs/v1/solana/So11111111111111111111111111111111111111112")
-            if data and isinstance(data, list):
-                for pair in data[:3]:
-                    try:
-                        p = float(pair.get("priceUsd", 0) or 0)
-                        if p > 0:
-                            result[0] = p
-                            return
-                    except: pass
+    # CoinGecko: tiny response, always fast
+    data = fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
+    if data and isinstance(data, dict) and "solana" in data:
+        try: return float(data["solana"]["usd"])
         except: pass
-    t = threading.Thread(target=_fetch)
-    t.start()
-    t.join(timeout=4)
-    return result[0]
+    return 0.0
 
 def update_fear_greed():
     global fear_greed_value, fear_greed_label
@@ -1340,17 +1328,21 @@ def get_stats():
 
 init_db()
 
+# Don't start here — let the worker start it on first request
 _started = False
-def start_all():
+
+@app.before_request
+def _ensure_started():
     global _started
     if not _started:
         _started = True
-        _log("Starting Graduation Sniper v6...")
-        threading.Thread(target=main_loop, daemon=True, name="main_loop").start()
-        threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
-        _log("🎯 SNIPER v6 LIVE — Pre-graduation detection + instant alerts + exit signals")
+        start_all()
 
-start_all()
+def start_all():
+    _log("Starting Graduation Sniper v6...")
+    threading.Thread(target=main_loop, daemon=True, name="main_loop").start()
+    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+    _log("🎯 SNIPER v6 LIVE — Pre-graduation detection + instant alerts + exit signals")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
