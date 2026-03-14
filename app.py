@@ -683,23 +683,39 @@ def main_loop():
             S.loop_ts = time.time()
             S.loop_count += 1
             tick += 1
+            errors_this_tick = []
 
             # Every tick (~3s): HOT tier
-            monitor_hot()
+            try:
+                monitor_hot()
+            except Exception as e:
+                errors_this_tick.append(f"HOT: {e}")
 
             # Every 2 ticks (~6s): WARM tier + Pump.fun scan
             if tick % 2 == 0:
-                scan_pumpfun()
-                monitor_warm()
+                try:
+                    scan_pumpfun()
+                except Exception as e:
+                    errors_this_tick.append(f"PumpFun: {e}")
+                try:
+                    monitor_warm()
+                except Exception as e:
+                    errors_this_tick.append(f"WARM: {e}")
 
             # Every 5 ticks (~15s): COLLECTION batch
             if tick % 5 == 0:
-                monitor_collection()
+                try:
+                    monitor_collection()
+                except Exception as e:
+                    errors_this_tick.append(f"COLLECTION: {e}")
 
             # Every 10 ticks (~30s): SOL price + Helius trades for warm/hot
             if tick % 10 == 0:
-                refresh_sol_price()
-                for addr in list(S.tiers.get("WARM", set())) | list(S.tiers.get("HOT", set())):
+                try:
+                    refresh_sol_price()
+                except Exception as e:
+                    errors_this_tick.append(f"SOL: {e}")
+                for addr in list(S.tiers.get("WARM", set()) | S.tiers.get("HOT", set())):
                     try:
                         fetch_helius_trades(addr)
                     except Exception as e:
@@ -715,8 +731,21 @@ def main_loop():
 
             # Every 20 ticks (~60s): cleanup + FNG
             if tick % 20 == 0:
-                cleanup_tiers()
-                refresh_fng()
+                try:
+                    cleanup_tiers()
+                    refresh_fng()
+                except Exception as e:
+                    errors_this_tick.append(f"cleanup: {e}")
+
+            # Track consecutive errors for health monitoring
+            if errors_this_tick:
+                S.consecutive_errors = getattr(S, 'consecutive_errors', 0) + 1
+                S.last_error = errors_this_tick[-1]
+                S.last_error_time = time.time()
+                for err in errors_this_tick:
+                    log.error("Section error (tick %d): %s", tick, err)
+            else:
+                S.consecutive_errors = 0
 
             time.sleep(3)
         except Exception as e:
@@ -853,9 +882,41 @@ def index():
 @app.route("/health")
 def health():
     age = time.time() - S.loop_ts if S.loop_ts else 999
+    consec = getattr(S, 'consecutive_errors', 0)
+    last_err = getattr(S, 'last_error', None)
+    last_err_time = getattr(S, 'last_error_time', None)
+    
+    status_data = {
+        "status": "ok",
+        "loop_age": age,
+        "version": VERSION,
+        "consecutive_errors": consec,
+        "last_error": last_err,
+        "last_error_time": last_err_time,
+        "total_snapshots": 0,
+    }
+    
+    # Check snapshot count for health
+    try:
+        with db() as conn:
+            status_data["total_snapshots"] = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    except Exception:
+        pass
+    
+    unhealthy = False
+    reasons = []
     if age > 30:
-        return jsonify({"status": "unhealthy", "loop_age": age, "version": VERSION}), 500
-    return jsonify({"status": "ok", "loop_age": age, "version": VERSION})
+        unhealthy = True
+        reasons.append(f"loop_stale_{age:.0f}s")
+    if consec >= 10:
+        unhealthy = True
+        reasons.append(f"errors_x{consec}")
+    
+    if unhealthy:
+        status_data["status"] = "unhealthy"
+        status_data["reasons"] = reasons
+        return jsonify(status_data), 500
+    return jsonify(status_data)
 
 # --- Logs ---
 @app.route("/logs")
