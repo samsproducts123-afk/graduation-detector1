@@ -125,7 +125,13 @@ def init_db():
                 fng_at_grad INTEGER,
                 has_website INTEGER DEFAULT 0,
                 has_twitter INTEGER DEFAULT 0,
-                has_telegram INTEGER DEFAULT 0
+                has_telegram INTEGER DEFAULT 0,
+                bundle_detected INTEGER DEFAULT 0,
+                bundle_buy_count INTEGER DEFAULT 0,
+                top1_holder_pct REAL DEFAULT 0,
+                top5_holder_pct REAL DEFAULT 0,
+                top10_holder_pct REAL DEFAULT 0,
+                creator_prev_tokens INTEGER DEFAULT -1
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -225,10 +231,13 @@ def fetch_helius_trades(address, detected_at):
         if not data or not isinstance(data, list):
             return
         now = time.time()
+        # Bundle detection: group buys by block/slot
+        buys_by_slot = {}
         with db() as conn:
             for tx in data[:30]:
                 sig = tx.get("signature", "")
                 ts = tx.get("timestamp", now)
+                slot = tx.get("slot", 0)
                 age = ts - detected_at if ts > detected_at else now - detected_at
                 native_transfers = tx.get("nativeTransfers", [])
                 token_transfers = tx.get("tokenTransfers", [])
@@ -247,6 +256,8 @@ def fetch_helius_trades(address, detected_at):
                         elif tt.get("fromUserAccount", ""):
                             wallet = tt["fromUserAccount"]
                             direction = "sell"
+                if direction == "buy" and slot:
+                    buys_by_slot.setdefault(slot, []).append(wallet)
                 try:
                     conn.execute("""
                         INSERT OR IGNORE INTO trades (address, ts, age_seconds, signature, direction, sol_amount, token_amount, wallet)
@@ -254,8 +265,74 @@ def fetch_helius_trades(address, detected_at):
                     """, (address, ts, age, sig, direction, sol_amt, tok_amt, wallet))
                 except Exception:
                     pass
+            # Bundle detection: if 3+ buys in same slot, likely bundled
+            bundled_slots = {s: wallets for s, wallets in buys_by_slot.items() if len(wallets) >= 3}
+            if bundled_slots:
+                bundle_count = sum(len(w) for w in bundled_slots.values())
+                conn.execute("UPDATE tokens SET bundle_detected=?, bundle_buy_count=? WHERE address=?",
+                             (1, bundle_count, address))
+                log.info(f"⚠️ Bundle detected {address[:8]}...: {bundle_count} buys in {len(bundled_slots)} slots")
     except Exception as e:
         log.warning(f"Helius trades error {address[:8]}: {e}")
+
+
+def fetch_holder_concentration(address):
+    """Get top holder concentration via Helius getTokenLargestAccounts. Non-blocking."""
+    try:
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenLargestAccounts",
+            "params": [address]
+        }
+        import urllib.request
+        req = Request(url, data=json.dumps(payload).encode(),
+                     headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read(FETCH_MAX_BYTES))
+        accounts = data.get("result", {}).get("value", [])
+        if not accounts:
+            return
+        # Calculate concentration
+        amounts = [float(a.get("uiAmount") or a.get("amount", 0)) for a in accounts]
+        total = sum(amounts)
+        if total <= 0:
+            return
+        top1_pct = (amounts[0] / total * 100) if amounts else 0
+        top5_pct = (sum(amounts[:5]) / total * 100) if len(amounts) >= 5 else top1_pct
+        top10_pct = (sum(amounts[:10]) / total * 100) if len(amounts) >= 10 else top5_pct
+        with db() as conn:
+            conn.execute("UPDATE tokens SET top1_holder_pct=?, top5_holder_pct=?, top10_holder_pct=? WHERE address=?",
+                         (round(top1_pct, 2), round(top5_pct, 2), round(top10_pct, 2), address))
+        log.info(f"Holders {address[:8]}...: top1={top1_pct:.1f}% top5={top5_pct:.1f}% top10={top10_pct:.1f}%")
+    except Exception as e:
+        log.warning(f"Holder concentration error {address[:8]}: {e}")
+
+
+def fetch_creator_history(address, creator):
+    """Check if creator wallet has launched tokens before via Helius. Non-blocking."""
+    if not creator:
+        return
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{creator}/transactions?api-key={HELIUS_KEY}&type=SWAP&limit=5"
+        data = fetch_json(url, timeout=8)
+        if not data or not isinstance(data, list):
+            return
+        # Count unique token mints this creator interacted with
+        mints = set()
+        for tx in data:
+            for tt in tx.get("tokenTransfers", []):
+                mint = tt.get("mint", "")
+                if mint and mint != address and mint != "So11111111111111111111111111111111111111112":
+                    mints.add(mint)
+        prev_tokens = len(mints)
+        with db() as conn:
+            conn.execute("UPDATE tokens SET creator_prev_tokens=? WHERE address=?",
+                         (prev_tokens, address))
+        if prev_tokens > 0:
+            log.info(f"Creator {creator[:8]}... has {prev_tokens} previous tokens for {address[:8]}...")
+    except Exception as e:
+        log.warning(f"Creator history error {address[:8]}: {e}")
 
 # ── RugCheck (threaded, non-blocking) ─────────────────────────────────────────
 def check_rugcheck(address):
@@ -822,7 +899,7 @@ def main_loop():
         except Exception as e:
             log.warning(f"SOL/FNG refresh error: {e}")
 
-        # ── Section 5: Helius trades for extended monitoring tokens (every 60 sec) ──
+        # ── Section 5: Helius enrichment for extended monitoring tokens (every 60 sec) ──
         try:
             if tick % 20 == 0:  # every ~60 sec
                 with tracking_lock:
@@ -830,8 +907,24 @@ def main_loop():
                 for addr in ext_addrs:
                     det = extended_tokens.get(addr, time.time())
                     threading.Thread(target=fetch_helius_trades, args=(addr, det), daemon=True).start()
+                # Holder concentration for first 3 extended tokens (stagger to avoid rate limits)
+                for addr in ext_addrs[:3]:
+                    threading.Thread(target=fetch_holder_concentration, args=(addr,), daemon=True).start()
         except Exception as e:
-            log.warning(f"Helius trades section error: {e}")
+            log.warning(f"Helius enrichment error: {e}")
+
+        # ── Section 5b: Creator history for new tokens (every 30 ticks ~90 sec) ──
+        try:
+            if tick % 30 == 15:
+                with db() as conn:
+                    rows = conn.execute(
+                        "SELECT address, pre_creator FROM tokens WHERE creator_prev_tokens=-1 AND pre_creator!='' LIMIT 3"
+                    ).fetchall()
+                for row in rows:
+                    threading.Thread(target=fetch_creator_history,
+                                     args=(row["address"], row["pre_creator"]), daemon=True).start()
+        except Exception as e:
+            log.warning(f"Creator history section error: {e}")
 
         # ── Section 6: DB cleanup (every 500 ticks ~25 min) ──
         if tick % 500 == 0:
@@ -1153,6 +1246,12 @@ def api_waves():
                 "has_website": tok["has_website"],
                 "has_twitter": tok["has_twitter"],
                 "has_telegram": tok["has_telegram"],
+                "bundle_detected": tok["bundle_detected"],
+                "bundle_buy_count": tok["bundle_buy_count"],
+                "top1_holder_pct": tok["top1_holder_pct"],
+                "top5_holder_pct": tok["top5_holder_pct"],
+                "top10_holder_pct": tok["top10_holder_pct"],
+                "creator_prev_tokens": tok["creator_prev_tokens"],
                 "status": tok["status"],
                 "snapshot_count": len(snaps),
                 "prices": prices,
