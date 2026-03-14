@@ -640,8 +640,8 @@ def register_graduation(address, symbol, name, pre_data):
     with tracking_lock:
         first_minute_tokens[address] = now
 
-    # Fire off RugCheck in background
-    threading.Thread(target=check_rugcheck, args=(address,), daemon=True).start()
+    # RugCheck disabled for collection mode — causes 429 rate limits with many tokens
+    # threading.Thread(target=check_rugcheck, args=(address,), daemon=True).start()
 
     dur_str = f" curve_dur={curve_duration:.0f}s" if curve_duration else ""
     log.info(f"🎓 GRADUATED: {symbol} ({address[:8]}...) participants={pg.get('num_participants',0)} replies={pg.get('reply_count',0)}{dur_str}")
