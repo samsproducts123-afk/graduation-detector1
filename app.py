@@ -31,7 +31,7 @@ HELIUS_KEY = os.environ.get("HELIUS_API_KEY", "b85d5357-36d9-4e26-b945-f38a0677b
 SIM_MODE = os.environ.get("SIM_MODE", "1") == "1"  # simulation by default
 
 PUMP_LIVE_URL = "https://frontend-api-v3.pump.fun/coins/currently-live?limit=100&includeNsfw=false"
-DEXSCREENER_BATCH = "https://api.dexscreener.com/token-pairs/v1/solana/{}"
+DEXSCREENER_BATCH = "https://api.dexscreener.com/latest/dex/tokens/{}"
 RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 COINGECKO_SOL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 FNG_URL = "https://api.alternative.me/fng/?limit=1"
