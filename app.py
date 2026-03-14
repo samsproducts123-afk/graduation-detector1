@@ -506,8 +506,8 @@ def _evaluate_token(conn, addr, now):
     rows = conn.execute("""
         SELECT * FROM snapshots WHERE address=? ORDER BY ts DESC LIMIT 10
     """, (addr,)).fetchall()
-    if len(rows) < 2:
-        return
+    if len(rows) < 3:
+        return  # Need at least 3 snapshots to see a TREND, not just 2 data points
 
     latest = dict(rows[0])
     prev = dict(rows[1])
@@ -548,9 +548,11 @@ def _evaluate_token(conn, addr, now):
         if mint_ok and vol_accel and buy_dominant and price_up:
             _signal_entry(conn, addr, tok, price, now)
 
-    # --- Exit logic (Step 6) ---
+    # --- Exit logic (Step 6) — wait at least 15s after entry to avoid instant exit ---
     if status == "entered":
-        _check_exits(conn, addr, tok, latest, rows, now)
+        entry_age = now - (tok.get("entry_time") or now)
+        if entry_age >= 15:
+            _check_exits(conn, addr, tok, latest, rows, now)
 
 def _set_tier(conn, addr, new_tier):
     tok = S.tokens.get(addr)
@@ -601,8 +603,8 @@ def _check_exits(conn, addr, tok, latest, rows, now):
             ps = prev_snap.get("sells_m5", 0) or 0
             if ps > 0 and (pb / max(ps, 1)) < 0.7:
                 exit_reason = "BUY_SELL_RATIO"
-    # 3. Volume death (60% drop from what we've seen)
-    if not exit_reason and len(rows) >= 5:
+    # 3. Volume death (60% drop from what we've seen) — need 5+ snapshots and 30s minimum
+    if not exit_reason and len(rows) >= 5 and age > 30:
         peak_vol = max((dict(r).get("volume_m5", 0) or 0) for r in rows[:5])
         if peak_vol > 0 and vol < peak_vol * 0.4:
             exit_reason = "VOLUME_DEATH"
@@ -652,22 +654,35 @@ def _create_alert(conn, addr, symbol, atype, msg, now):
 
 def cleanup_tiers():
     now = time.time()
+    expired_count = 0
     with db() as conn:
         for addr in list(S.tokens):
             tok = S.tokens[addr]
             age = now - tok["detected_at"]
             if age > 600 and tok["status"] in ("watching", "exited"):
-                # 10 min+ and not active → remove from active tracking
+                # 10 min+ and not active → remove from active tiers (but keep in S.tokens)
                 for tier_set in S.tiers.values():
                     tier_set.discard(addr)
-                # Keep in DB, remove from memory
                 if tok["status"] == "watching":
                     conn.execute("UPDATE tokens SET status='expired' WHERE address=?", (addr,))
-        # Also trim watchlist memory (keep last 500)
+                    tok["status"] = "expired"
+                expired_count += 1
+        # Remove truly old tokens from memory (30 min+) to prevent unbounded growth
+        for addr in list(S.tokens):
+            tok = S.tokens[addr]
+            age = now - tok["detected_at"]
+            if age > 1800 and tok["status"] in ("expired", "exited"):
+                del S.tokens[addr]
+                for tier_set in S.tiers.values():
+                    tier_set.discard(addr)
+        # Trim watchlist memory (keep last 500)
         if len(S.watchlist) > 500:
             sorted_wl = sorted(S.watchlist.items(), key=lambda x: x[1]["last_seen"])
             for k, _ in sorted_wl[:len(S.watchlist) - 500]:
                 del S.watchlist[k]
+    if expired_count:
+        log.info("Cleanup: expired %d tokens, %d active, %d in memory",
+                 expired_count, sum(len(v) for v in S.tiers.values()), len(S.tokens))
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -746,6 +761,16 @@ def main_loop():
                     log.error("Section error (tick %d): %s", tick, err)
             else:
                 S.consecutive_errors = 0
+
+            # Snapshot sanity check — warn if no data flowing after 100 ticks
+            if tick == 100:
+                try:
+                    with db() as conn:
+                        snap_count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+                    if snap_count == 0:
+                        log.error("CRITICAL: 100 ticks completed but ZERO snapshots. DexScreener data not flowing!")
+                except Exception:
+                    pass
 
             time.sleep(3)
         except Exception as e:
