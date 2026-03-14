@@ -20,7 +20,7 @@ from flask import Flask, g, jsonify, request
 VERSION = "v8-collector"
 DB_PATH = os.environ.get("DB_PATH", "collector_v8.db")
 FETCH_TIMEOUT = 5
-FETCH_MAX_BYTES = 500_000  # 500KB cap
+FETCH_MAX_BYTES = 1_000_000  # 1MB cap
 LOG_LINES = 2000
 
 PUMP_LIVE_URL = "https://frontend-api-v3.pump.fun/coins/currently-live"
@@ -486,6 +486,12 @@ def scan_pumpfun():
                 # Mark graduated in pre_graduation
                 with db() as conn:
                     conn.execute("UPDATE pre_graduation SET graduated=1 WHERE address=?", (addr,))
+                    # If this was a bonding_curve token from GeckoTerminal, promote it
+                    conn.execute("UPDATE tokens SET status='collecting' WHERE address=? AND status='bonding_curve'", (addr,))
+                # Start first-minute monitoring
+                with tracking_lock:
+                    if addr not in first_minute_tokens and addr not in extended_tokens:
+                        first_minute_tokens[addr] = time.time()
         except Exception as e:
             log.warning(f"scan_pumpfun coin error: {e}")
 
@@ -560,9 +566,7 @@ def scan_dexscreener_new():
                 # Get DEX type
                 dex_id = (rels.get("dex", {}).get("data", {}).get("id", "") or "").lower()
 
-                # Skip pump-fun bonding curve pools (not graduated yet)
-                if dex_id == "pump-fun":
-                    continue
+                # Track ALL tokens including bonding curve — collect everything, filter later
 
                 # Get token address from base_token relationship
                 base_token_id = rels.get("base_token", {}).get("data", {}).get("id", "")
@@ -614,9 +618,12 @@ def scan_dexscreener_new():
     return new_grads
 
 def register_graduation(address, symbol, name, pre_data):
-    """Register a newly graduated token for monitoring."""
+    """Register a newly detected token for monitoring.
+    Works for graduated tokens (PumpSwap, Meteora, Raydium) AND bonding curve tokens."""
     now = time.time()
     pg = pre_data or {}
+    source_dex = pg.get("source_dex", "")
+    is_bonding_curve = (source_dex == "pump-fun")
 
     # Calculate bonding curve duration (creation to graduation)
     created_ts = pg.get("created_timestamp", 0)
@@ -634,22 +641,28 @@ def register_graduation(address, symbol, name, pre_data):
     has_twitter = 1 if pg.get("twitter") else 0
     has_telegram = 1 if pg.get("telegram") else 0
 
+    # Status: 'bonding_curve' for pre-graduation, 'collecting' for tradable tokens
+    status = "bonding_curve" if is_bonding_curve else "collecting"
+
     with db() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO tokens (address, symbol, name, detected_at, status, last_update,
                 pre_participants, pre_replies, pre_curve_pct, pre_velocity, pre_ath_mcap, pre_creator,
                 pre_created_ts, curve_duration_sec, graduation_hour, graduation_dow,
                 sol_price_at_grad, fng_at_grad, has_website, has_twitter, has_telegram)
-            VALUES (?, ?, ?, ?, 'collecting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (address, symbol, name, now, now,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (address, symbol, name, now, status, now,
               pg.get("num_participants", 0), pg.get("reply_count", 0),
               pg.get("curve_pct", 0), pg.get("velocity", 0),
               pg.get("ath_market_cap", 0), pg.get("creator", ""),
               created_ts, curve_duration, grad_hour, grad_dow,
               get_sol_price(), get_fng_value(), has_website, has_twitter, has_telegram))
 
-    with tracking_lock:
-        first_minute_tokens[address] = now
+    # Bonding curve tokens: track in DB but don't monitor price (no DEX pair yet)
+    # When they graduate, Pump.fun scan will detect it and promote to first_minute
+    if not is_bonding_curve:
+        with tracking_lock:
+            first_minute_tokens[address] = now
 
     # RugCheck disabled for collection mode — causes 429 rate limits with many tokens
     # threading.Thread(target=check_rugcheck, args=(address,), daemon=True).start()
@@ -802,7 +815,7 @@ def main_loop():
         # ── Section 4: SOL price + FNG refresh (every 30 sec) ──
         try:
             now = time.time()
-            if now - last_sol_refresh >= 30:
+            if now - last_sol_refresh >= 60:  # Every 60 sec (was 30, CoinGecko rate limits)
                 last_sol_refresh = now
                 refresh_sol_price()
                 refresh_fng()
