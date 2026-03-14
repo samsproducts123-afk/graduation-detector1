@@ -17,6 +17,7 @@ import json
 import threading
 import sqlite3
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
 from flask import Flask, jsonify, request as flask_request
@@ -68,6 +69,19 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+@contextmanager
+def db():
+    """Context manager — guarantees connection is always closed, even on crash."""
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     conn = get_db()
@@ -261,11 +275,21 @@ def calc_return(initial_price, current_price):
         return None
 
 def get_sol_price():
-    # CoinGecko: tiny response, always fast
+    # Try CoinGecko first (tiny response)
     data = fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
     if data and isinstance(data, dict) and "solana" in data:
-        try: return float(data["solana"]["usd"])
+        try:
+            p = float(data["solana"]["usd"])
+            if p > 0: return p
         except: pass
+    # Fallback: DexScreener SOL/USDC pair (specific pair, small response)
+    data = fetch_json(f"{DEXSCREENER_BASE}/token-pairs/v1/solana/So11111111111111111111111111111111111111112")
+    if data and isinstance(data, list):
+        for pair in data[:3]:
+            try:
+                p = float(pair.get("priceUsd", 0) or 0)
+                if p > 0: return p
+            except: pass
     return 0.0
 
 def update_fear_greed():
@@ -303,50 +327,41 @@ def _check_pumpfun():
         return 0
     
     stats["pumpfun_checks"] += 1
-    conn = get_db()
     now = int(time.time())
     new_watched = 0
     
-    for token in data:
-        mint = token.get("mint", "")
-        if not mint:
-            continue
-        
-        mcap = token.get("usd_market_cap", 0) or 0
-        if mcap < GRADUATION_MCAP * PRE_GRAD_THRESHOLD:
-            continue
-        
-        symbol = token.get("symbol", "???")
-        name = token.get("name", "Unknown")
-        
-        existing = conn.execute("SELECT * FROM watchlist WHERE mint=?", (mint,)).fetchone()
-        
-        if existing:
-            # Update tracking
-            prev_mcap = existing["last_seen_mcap"] or mcap
-            prev_ts = existing["last_seen_ts"] or now
-            elapsed = now - (existing["first_seen_ts"] or now)
+    with db() as conn:
+        for token in data:
+            mint = token.get("mint", "")
+            if not mint:
+                continue
             
-            # Velocity: how fast is mcap growing? ($/second)
-            if elapsed > 0:
-                velocity = (mcap - (existing["first_seen_mcap"] or 0)) / elapsed
+            mcap = token.get("usd_market_cap", 0) or 0
+            if mcap < GRADUATION_MCAP * PRE_GRAD_THRESHOLD:
+                continue
+            
+            symbol = token.get("symbol", "???")
+            name = token.get("name", "Unknown")
+            
+            existing = conn.execute("SELECT * FROM watchlist WHERE mint=?", (mint,)).fetchone()
+            
+            if existing:
+                prev_mcap = existing["last_seen_mcap"] or mcap
+                prev_ts = existing["last_seen_ts"] or now
+                elapsed = now - (existing["first_seen_ts"] or now)
+                velocity = (mcap - (existing["first_seen_mcap"] or 0)) / elapsed if elapsed > 0 else 0
+                conn.execute("""
+                    UPDATE watchlist SET last_seen_ts=?, last_seen_mcap=?, velocity_score=?, check_count=check_count+1
+                    WHERE mint=?
+                """, (now, mcap, velocity, mint))
             else:
-                velocity = 0
-            
-            conn.execute("""
-                UPDATE watchlist SET last_seen_ts=?, last_seen_mcap=?, velocity_score=?, check_count=check_count+1
-                WHERE mint=?
-            """, (now, mcap, velocity, mint))
-        else:
-            conn.execute("""
-                INSERT INTO watchlist (mint, symbol, name, first_seen_ts, first_seen_mcap, last_seen_ts, last_seen_mcap, velocity_score, check_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
-            """, (mint, symbol, name, now, mcap, now, mcap))
-            new_watched += 1
-            stats["pre_grad_watched"] += 1
+                conn.execute("""
+                    INSERT INTO watchlist (mint, symbol, name, first_seen_ts, first_seen_mcap, last_seen_ts, last_seen_mcap, velocity_score, check_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
+                """, (mint, symbol, name, now, mcap, now, mcap))
+                new_watched += 1
+                stats["pre_grad_watched"] += 1
     
-    conn.commit()
-    conn.close()
     if new_watched > 0:
         _log(f"Pump.fun: {new_watched} new tokens on watchlist")
     return new_watched
@@ -354,91 +369,67 @@ def _check_pumpfun():
 
 def _pre_score():
     """Pre-score tokens that are close to graduation but not yet scored."""
-    conn = get_db()
-    
-    # Get tokens at 80%+ of graduation that haven't been scored
-    candidates = conn.execute("""
-        SELECT mint, symbol FROM watchlist 
-        WHERE pre_scored=0 AND graduated=0 AND last_seen_mcap >= ?
-        ORDER BY velocity_score DESC LIMIT 2
-    """, (GRADUATION_MCAP * 0.80,)).fetchall()
+    with db() as conn:
+        candidates = conn.execute("""
+            SELECT mint, symbol FROM watchlist 
+            WHERE pre_scored=0 AND graduated=0 AND last_seen_mcap >= ?
+            ORDER BY velocity_score DESC LIMIT 2
+        """, (GRADUATION_MCAP * 0.80,)).fetchall()
+        candidates = [dict(c) for c in candidates]  # materialize before API calls
     
     for token in candidates:
         mint = token["mint"]
         
-        # Quick safety check via RugCheck
         rc_data = fetch_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary")
-        
-        # Check creator reputation
         creator = get_creator_wallet(mint)
         creator_rep = "unknown"
         if rc_data:
-            risks = rc_data.get("risks", [])
-            for risk in risks:
+            for risk in (rc_data.get("risks") or []):
                 if "rug" in str(risk.get("description", "")).lower():
                     creator_rep = "serial_rugger"
                     break
         
-        # Simple pre-score based on available data
         score = 0
         max_score = 137
-        
         if rc_data:
-            # Mint authority
-            if rc_data.get("mintAuthority") is None:
-                score += 8
-            # Freeze authority
-            if rc_data.get("freezeAuthority") is None:
-                score += 8
-            # LP locked
+            if rc_data.get("mintAuthority") is None: score += 8
+            if rc_data.get("freezeAuthority") is None: score += 8
             lp_pct = rc_data.get("lpLockedPct", 0) or 0
-            if lp_pct >= 90:
-                score += 7
-            elif lp_pct >= 50:
-                score += 4
-            # Risk score
+            if lp_pct >= 90: score += 7
+            elif lp_pct >= 50: score += 4
             risk_level = rc_data.get("score", 0)
-            if risk_level and risk_level < 500:
-                score += 6
-            elif risk_level and risk_level < 2000:
-                score += 4
-            # Creator history
-            if creator_rep != "serial_rugger":
-                score += 10
+            if risk_level and risk_level < 500: score += 6
+            elif risk_level and risk_level < 2000: score += 4
+            if creator_rep != "serial_rugger": score += 10
         
-        # We can't do full 33-layer score without DexScreener pair data (not available pre-graduation)
-        # But this gives us a safety baseline. Full score happens at graduation.
         pct = round(score * 100.0 / max_score, 1) if max_score > 0 else 0
-        verdict = "PRE-SCORED"
         
-        conn.execute("""
-            UPDATE watchlist SET pre_scored=1, v1_score=?, v1_pct=?, v1_verdict=?,
-            creator_wallet=?, creator_reputation=?
-            WHERE mint=?
-        """, (score, pct, verdict, creator, creator_rep, mint))
+        with db() as conn:
+            conn.execute("""
+                UPDATE watchlist SET pre_scored=1, v1_score=?, v1_pct=?, v1_verdict='PRE-SCORED',
+                creator_wallet=?, creator_reputation=?
+                WHERE mint=?
+            """, (score, pct, creator, creator_rep, mint))
         
         stats["pre_grad_scored"] += 1
         _log(f"Pre-scored {token['symbol']}: {score}pts, creator={creator_rep}")
         time.sleep(0.5)
-    
-    conn.commit()
-    conn.close()
 
 
 # ── PHASE 2: Graduation Detection ──────────────────────────────────────
 
 def _check_grads():
     """Check if any watched tokens have graduated (appear on DexScreener)."""
-    conn = get_db()
     now = int(time.time())
     
-    # Get pre-scored, non-graduated tokens
-    watched = conn.execute("""
-        SELECT mint, symbol, name, first_seen_ts, first_seen_mcap, velocity_score,
-               v1_score, v1_pct, creator_wallet, creator_reputation
-        FROM watchlist WHERE graduated=0 AND pre_scored=1
-        ORDER BY velocity_score DESC LIMIT 3
-    """).fetchall()
+    with db() as conn:
+        watched = conn.execute("""
+            SELECT mint, symbol, name, first_seen_ts, first_seen_mcap, velocity_score,
+                   v1_score, v1_pct, creator_wallet, creator_reputation
+            FROM watchlist WHERE graduated=0 AND pre_scored=1
+            ORDER BY velocity_score DESC LIMIT 3
+        """).fetchall()
+        watched = [dict(w) for w in watched]  # materialize before closing
     
     for token in watched:
         mint = token["mint"]
@@ -447,7 +438,6 @@ def _check_grads():
         if not pair:
             continue
         
-        # Token has graduated! It's on DexScreener now.
         dex = pair.get("dexId", "")
         if dex not in ("raydium", "pumpswap", "orca"):
             continue
@@ -456,24 +446,15 @@ def _check_grads():
         if liq < 3000:
             continue
         
-        # Calculate graduation velocity
         first_seen = token["first_seen_ts"]
         grad_time = now - first_seen if first_seen else 0
         velocity = token["velocity_score"] or 0
         
-        if grad_time > 0 and grad_time < 120:
-            vel_rating = "ROCKET"     # Graduated in < 2 min
-        elif grad_time < 300:
-            vel_rating = "FAST"       # < 5 min
-        elif grad_time < 600:
-            vel_rating = "NORMAL"     # < 10 min
-        else:
-            vel_rating = "SLOW"       # > 10 min
+        if grad_time > 0 and grad_time < 120: vel_rating = "ROCKET"
+        elif grad_time < 300: vel_rating = "FAST"
+        elif grad_time < 600: vel_rating = "NORMAL"
+        else: vel_rating = "SLOW"
         
-        # Mark as graduated
-        conn.execute("UPDATE watchlist SET graduated=1, graduated_ts=? WHERE mint=?", (now, mint))
-        
-        # Full token recording
         base = pair.get("baseToken", {})
         txns = pair.get("txns", {})
         pc = pair.get("priceChange", {})
@@ -485,95 +466,79 @@ def _check_grads():
         age_sec = (now * 1000 - created) / 1000 if created > 0 else 0
         holders = get_holder_count(mint)
         
-        with sol_price_lock:
-            current_sol = sol_price_usd
-        with fear_greed_lock:
-            fg = fear_greed_value
-        
+        with sol_price_lock: current_sol = sol_price_usd
+        with fear_greed_lock: fg = fear_greed_value
         now_dt = datetime.now(timezone.utc)
         
-        conn.execute("""
-            INSERT OR IGNORE INTO tokens
-            (address, symbol, name, dex_id, pair_address, pair_created_at, source,
-             detected_at, detected_ts, age_at_detection_sec,
-             t0_price, t0_liq, t0_vol_24h, t0_vol_h1, t0_vol_m5, t0_fdv, t0_mcap,
-             t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
-             t0_price_change_m5, t0_price_change_h1, t0_has_socials,
-             t0_holders, t0_sol_price, t0_fear_greed, t0_hour_utc, t0_day_of_week,
-             graduation_velocity, velocity_rating,
-             creator_wallet, creator_reputation,
-             v1_score, v1_pct, v1_verdict)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            mint, base.get("symbol", token["symbol"]), base.get("name", token["name"]),
-            dex, pair.get("pairAddress", ""), created, "pre_graduation",
-            now_dt.isoformat(), now, age_sec,
-            pair.get("priceUsd", "0"), liq,
-            vol.get("h24", 0), vol.get("h1", 0), vol.get("m5", 0),
-            pair.get("fdv", 0), pair.get("marketCap", 0),
-            (txns.get("m5") or {}).get("buys", 0), (txns.get("m5") or {}).get("sells", 0),
-            (txns.get("h1") or {}).get("buys", 0), (txns.get("h1") or {}).get("sells", 0),
-            pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
-            1 if (len(socials) > 0 or len(websites) > 0) else 0,
-            holders, current_sol, fg, now_dt.hour, now_dt.strftime("%A"),
-            velocity, vel_rating,
-            token["creator_wallet"], token["creator_reputation"],
-            token["v1_score"], token["v1_pct"], token["v1_verdict"],
-        ))
-        stats["tokens_tracked"] += 1
+        # Full scoring (API calls outside DB)
+        full_score = do_full_score(mint, pair)
         
-        # Generate BUY alert if score is promising + velocity is good
-        # Full scoring needs GoPlus + DexScreener data which we now have
-        full_score = do_full_score(mint, pair, conn)
-        
-        if full_score and full_score["pct"] >= SNIPE_THRESHOLD:
-            generate_buy_alert(conn, mint, pair, full_score, vel_rating, velocity, grad_time)
-        elif full_score and full_score["pct"] >= 65:
-            # WATCH alert - not auto-buy but worth monitoring
-            generate_watch_alert(conn, mint, pair, full_score, vel_rating)
+        with db() as conn:
+            conn.execute("UPDATE watchlist SET graduated=1, graduated_ts=? WHERE mint=?", (now, mint))
+            
+            conn.execute("""
+                INSERT OR IGNORE INTO tokens
+                (address, symbol, name, dex_id, pair_address, pair_created_at, source,
+                 detected_at, detected_ts, age_at_detection_sec,
+                 t0_price, t0_liq, t0_vol_24h, t0_vol_h1, t0_vol_m5, t0_fdv, t0_mcap,
+                 t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
+                 t0_price_change_m5, t0_price_change_h1, t0_has_socials,
+                 t0_holders, t0_sol_price, t0_fear_greed, t0_hour_utc, t0_day_of_week,
+                 graduation_velocity, velocity_rating,
+                 creator_wallet, creator_reputation,
+                 v1_score, v1_pct, v1_verdict)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                mint, base.get("symbol", token["symbol"]), base.get("name", token["name"]),
+                dex, pair.get("pairAddress", ""), created, "pre_graduation",
+                now_dt.isoformat(), now, age_sec,
+                pair.get("priceUsd", "0"), liq,
+                vol.get("h24", 0), vol.get("h1", 0), vol.get("m5", 0),
+                pair.get("fdv", 0), pair.get("marketCap", 0),
+                (txns.get("m5") or {}).get("buys", 0), (txns.get("m5") or {}).get("sells", 0),
+                (txns.get("h1") or {}).get("buys", 0), (txns.get("h1") or {}).get("sells", 0),
+                pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
+                1 if (len(socials) > 0 or len(websites) > 0) else 0,
+                holders, current_sol, fg, now_dt.hour, now_dt.strftime("%A"),
+                velocity, vel_rating,
+                token["creator_wallet"], token["creator_reputation"],
+                full_score["score"] if full_score else token["v1_score"],
+                full_score["pct"] if full_score else token["v1_pct"],
+                full_score["verdict"] if full_score else "PRE-SCORED",
+            ))
+            stats["tokens_tracked"] += 1
+            
+            if full_score and full_score["pct"] >= SNIPE_THRESHOLD:
+                generate_buy_alert(conn, mint, pair, full_score, vel_rating, velocity, grad_time)
+            elif full_score and full_score["pct"] >= 65:
+                generate_watch_alert(conn, mint, pair, full_score, vel_rating)
         
         _log(f"GRADUATED: {token['symbol']} vel={vel_rating} ({grad_time}s) score={full_score['pct'] if full_score else '?'}%")
         time.sleep(0.3)
-    
-    conn.commit()
-    conn.close()
 
 
-def do_full_score(mint, pair, conn):
+def do_full_score(mint, pair):
     """Run full 33-layer V1 scoring with all available data."""
-    # Fetch GoPlus data
     gp_data = fetch_json(f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={mint}")
     gp = None
     if gp_data and gp_data.get("result"):
         gp = gp_data["result"].get(mint.lower()) or gp_data["result"].get(mint)
     
-    # Fetch RugCheck data
     rc_data = fetch_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary")
     
-    # Run the 33-layer scorer
     score, max_score, details = score_v1(pair, rc_data, gp)
     pct = round(score * 100.0 / max_score, 1) if max_score > 0 else 0
     
-    if pct >= SNIPE_THRESHOLD:
-        verdict = "SNIPE"
-    elif pct >= 65:
-        verdict = "WATCH"
-    elif pct >= 50:
-        verdict = "NEUTRAL"
-    else:
-        verdict = "SKIP"
+    if pct >= SNIPE_THRESHOLD: verdict = "SNIPE"
+    elif pct >= 65: verdict = "WATCH"
+    elif pct >= 50: verdict = "NEUTRAL"
+    else: verdict = "SKIP"
     
-    # Check for RUGGER override
     if rc_data:
         for risk in (rc_data.get("risks") or []):
-            desc = str(risk.get("description", "")).lower()
-            if "creator" in desc and "rug" in desc:
+            if "creator" in str(risk.get("description", "")).lower() and "rug" in str(risk.get("description", "")).lower():
                 verdict = "RUGGER"
                 break
-    
-    # Update token record
-    conn.execute("UPDATE tokens SET v1_score=?, v1_pct=?, v1_verdict=? WHERE address=?",
-                (score, pct, verdict, mint))
     
     return {"score": score, "max": max_score, "pct": pct, "verdict": verdict}
 
@@ -828,18 +793,19 @@ def generate_watch_alert(conn, mint, pair, score_data, vel_rating):
 
 def _monitor_pos():
     """Check active positions for exit signals."""
-    conn = get_db()
     now = int(time.time())
     
-    positions = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
+    with db() as conn:
+        positions = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
+        positions = [dict(p) for p in positions]
     
     for pos in positions:
         addr = pos["token_address"]
         elapsed = now - pos["entry_ts"]
         
-        # Time stop: after 20 minutes, force exit review
         if elapsed > 1200:
-            generate_exit_alert(conn, pos, "TIME_STOP", "20 min elapsed — review position")
+            with db() as conn:
+                generate_exit_alert(conn, pos, "TIME_STOP", "20 min elapsed — review position")
             continue
         
         pair = get_pair_data(addr)
@@ -848,58 +814,44 @@ def _monitor_pos():
         
         price = pair.get("priceUsd", "0")
         ret = calc_return(pos["entry_price"], price)
-        
         if ret is None:
             continue
         
-        # Update position
         peak_ret = pos["peak_return"] or -999
-        if ret > peak_ret:
-            conn.execute("UPDATE positions SET peak_price=?, peak_return=?, current_return=?, last_check_ts=? WHERE token_address=?",
-                        (price, ret, ret, now, addr))
-        else:
-            conn.execute("UPDATE positions SET current_return=?, last_check_ts=? WHERE token_address=?",
-                        (ret, now, addr))
         
-        # ── Exit conditions ──
-        
-        # Hard stop loss
-        if ret <= -8:
-            generate_exit_alert(conn, pos, "STOP_LOSS", f"Hit -8% stop loss ({ret:+.1f}%)")
-            continue
-        
-        # Peak drawdown: if we were up 50%+ but gave back more than half
-        if peak_ret > 50 and ret < peak_ret * 0.5:
-            generate_exit_alert(conn, pos, "PEAK_DRAWDOWN", f"Was +{peak_ret:.0f}%, now +{ret:.0f}% — sell before more loss")
-            continue
-        
-        # Buy/sell momentum check
-        txns = pair.get("txns", {})
-        buys = (txns.get("m5") or {}).get("buys", 0)
-        sells = (txns.get("m5") or {}).get("sells", 0)
-        
-        if sells > buys * 1.5 and elapsed > 30:
-            generate_exit_alert(conn, pos, "MOMENTUM_DEATH", f"Sellers dominating ({sells}s vs {buys}b) at {ret:+.1f}%")
-            continue
-        
-        # Volume death
-        vol = (pair.get("volume") or {}).get("m5", 0)
-        liq = (pair.get("liquidity") or {}).get("usd", 0)
-        if liq > 0 and vol == 0 and elapsed > 60:
-            generate_exit_alert(conn, pos, "VOLUME_DEATH", f"Zero volume at {ret:+.1f}%")
-            continue
-        
-        # Take profit signals
-        if ret >= 100 and elapsed > 15:
-            # House money alert
-            generate_exit_alert(conn, pos, "HOUSE_MONEY", f"🏦 +{ret:.0f}% — SELL 50%, ride the rest FREE")
-            # Don't close position, just alert
-            continue
+        with db() as conn:
+            if ret > peak_ret:
+                conn.execute("UPDATE positions SET peak_price=?, peak_return=?, current_return=?, last_check_ts=? WHERE token_address=?",
+                            (price, ret, ret, now, addr))
+            else:
+                conn.execute("UPDATE positions SET current_return=?, last_check_ts=? WHERE token_address=?",
+                            (ret, now, addr))
+            
+            # Exit conditions
+            if ret <= -8:
+                generate_exit_alert(conn, pos, "STOP_LOSS", f"Hit -8% stop loss ({ret:+.1f}%)")
+                continue
+            if peak_ret > 50 and ret < peak_ret * 0.5:
+                generate_exit_alert(conn, pos, "PEAK_DRAWDOWN", f"Was +{peak_ret:.0f}%, now +{ret:.0f}% — sell before more loss")
+                continue
+            
+            txns = pair.get("txns", {})
+            buys = (txns.get("m5") or {}).get("buys", 0)
+            sells = (txns.get("m5") or {}).get("sells", 0)
+            if sells > buys * 1.5 and elapsed > 30:
+                generate_exit_alert(conn, pos, "MOMENTUM_DEATH", f"Sellers dominating ({sells}s vs {buys}b) at {ret:+.1f}%")
+                continue
+            
+            vol = (pair.get("volume") or {}).get("m5", 0)
+            liq = (pair.get("liquidity") or {}).get("usd", 0)
+            if liq > 0 and vol == 0 and elapsed > 60:
+                generate_exit_alert(conn, pos, "VOLUME_DEATH", f"Zero volume at {ret:+.1f}%")
+                continue
+            
+            if ret >= 100 and elapsed > 15:
+                generate_exit_alert(conn, pos, "HOUSE_MONEY", f"🏦 +{ret:.0f}% — SELL 50%, ride the rest FREE")
         
         time.sleep(0.3)
-    
-    conn.commit()
-    conn.close()
 
 
 def generate_exit_alert(conn, pos, reason, detail):
@@ -931,10 +883,9 @@ def generate_exit_alert(conn, pos, reason, detail):
 
 def _discover_dx():
     """Backup discovery for tokens that bypass Pump.fun monitoring."""
-    conn = get_db()
-    known = set(r[0] for r in conn.execute("SELECT address FROM tokens").fetchall())
-    watched = set(r[0] for r in conn.execute("SELECT mint FROM watchlist").fetchall())
-    conn.close()
+    with db() as conn:
+        known = set(r[0] for r in conn.execute("SELECT address FROM tokens").fetchall())
+        watched = set(r[0] for r in conn.execute("SELECT mint FROM watchlist").fetchall())
     
     new_tokens = 0
     candidates = {}
@@ -961,7 +912,6 @@ def _discover_dx():
         if dex not in ("raydium", "pumpswap", "orca") or liq < 5000:
             continue
         
-        # Record
         now = int(time.time())
         base = pair.get("baseToken", {})
         created = pair.get("pairCreatedAt", 0)
@@ -977,33 +927,31 @@ def _discover_dx():
         with fear_greed_lock: fg = fear_greed_value
         now_dt = datetime.now(timezone.utc)
         
-        conn2 = get_db()
-        conn2.execute("""
-            INSERT OR IGNORE INTO tokens
-            (address, symbol, name, dex_id, pair_address, pair_created_at, source,
-             detected_at, detected_ts, age_at_detection_sec,
-             t0_price, t0_liq, t0_vol_24h, t0_vol_h1, t0_vol_m5, t0_fdv, t0_mcap,
-             t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
-             t0_price_change_m5, t0_price_change_h1, t0_has_socials,
-             t0_holders, t0_sol_price, t0_fear_greed, t0_hour_utc, t0_day_of_week,
-             graduation_velocity, velocity_rating)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            addr, base.get("symbol", "???"), base.get("name", ""),
-            dex, pair.get("pairAddress", ""), created, f"dexscreener_{src}",
-            now_dt.isoformat(), now, age_sec,
-            pair.get("priceUsd", "0"), liq,
-            vol.get("h24", 0), vol.get("h1", 0), vol.get("m5", 0),
-            pair.get("fdv", 0), pair.get("marketCap", 0),
-            (txns.get("m5") or {}).get("buys", 0), (txns.get("m5") or {}).get("sells", 0),
-            (txns.get("h1") or {}).get("buys", 0), (txns.get("h1") or {}).get("sells", 0),
-            pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
-            1 if (len(socials) > 0 or len(websites) > 0) else 0,
-            get_holder_count(addr), current_sol, fg, now_dt.hour, now_dt.strftime("%A"),
-            0, "UNKNOWN",
-        ))
-        conn2.commit()
-        conn2.close()
+        with db() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO tokens
+                (address, symbol, name, dex_id, pair_address, pair_created_at, source,
+                 detected_at, detected_ts, age_at_detection_sec,
+                 t0_price, t0_liq, t0_vol_24h, t0_vol_h1, t0_vol_m5, t0_fdv, t0_mcap,
+                 t0_buys_m5, t0_sells_m5, t0_buys_h1, t0_sells_h1,
+                 t0_price_change_m5, t0_price_change_h1, t0_has_socials,
+                 t0_holders, t0_sol_price, t0_fear_greed, t0_hour_utc, t0_day_of_week,
+                 graduation_velocity, velocity_rating)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                addr, base.get("symbol", "???"), base.get("name", ""),
+                dex, pair.get("pairAddress", ""), created, f"dexscreener_{src}",
+                now_dt.isoformat(), now, age_sec,
+                pair.get("priceUsd", "0"), liq,
+                vol.get("h24", 0), vol.get("h1", 0), vol.get("m5", 0),
+                pair.get("fdv", 0), pair.get("marketCap", 0),
+                (txns.get("m5") or {}).get("buys", 0), (txns.get("m5") or {}).get("sells", 0),
+                (txns.get("h1") or {}).get("buys", 0), (txns.get("h1") or {}).get("sells", 0),
+                pc.get("m5", 0) or 0, pc.get("h1", 0) or 0,
+                1 if (len(socials) > 0 or len(websites) > 0) else 0,
+                get_holder_count(addr), current_sol, fg, now_dt.hour, now_dt.strftime("%A"),
+                0, "UNKNOWN",
+            ))
         new_tokens += 1
         stats["tokens_tracked"] += 1
         time.sleep(0.25)
@@ -1017,24 +965,30 @@ def _discover_dx():
 # ── Snapshot Engine ─────────────────────────────────────────────────────
 
 def _take_snaps():
-    conn = get_db()
     now = int(time.time())
     with sol_price_lock: current_sol = sol_price_usd
 
-    tokens = conn.execute("""
-        SELECT address, detected_ts, t0_price, t0_liq, t0_buys_m5, t0_sells_m5, t0_vol_m5, peak_return
-        FROM tokens WHERE snapshots_complete=0 AND (?-detected_ts)<=700
-    """, (now,)).fetchall()
+    with db() as conn:
+        tokens = conn.execute("""
+            SELECT address, detected_ts, t0_price, t0_liq, t0_buys_m5, t0_sells_m5, t0_vol_m5, peak_return
+            FROM tokens WHERE snapshots_complete=0 AND (?-detected_ts)<=700
+        """, (now,)).fetchall()
+        tokens = [dict(t) for t in tokens]
 
     for token in tokens:
         addr = token["address"]
         elapsed = now - token["detected_ts"]
-        existing = set(r[0] for r in conn.execute("SELECT target_sec FROM snapshots WHERE token_address=?", (addr,)).fetchall())
+        
+        with db() as conn:
+            existing = set(r[0] for r in conn.execute("SELECT target_sec FROM snapshots WHERE token_address=?", (addr,)).fetchall())
+        
         due = [t for t in SNAPSHOT_TIMES if t not in existing and elapsed >= t and elapsed <= t + 60]
         if not due:
             if elapsed > max(SNAPSHOT_TIMES) + 60:
-                conn.execute("UPDATE tokens SET snapshots_complete=1 WHERE address=?", (addr,))
+                with db() as conn:
+                    conn.execute("UPDATE tokens SET snapshots_complete=1 WHERE address=?", (addr,))
             continue
+        
         pair = get_pair_data(addr)
         if not pair: continue
 
@@ -1048,56 +1002,55 @@ def _take_snaps():
         liq_change = round((liq - token["t0_liq"]) / token["t0_liq"] * 100, 2) if token["t0_liq"] > 0 else 0
         bs_ratio = round(buys_m5 / sells_m5, 2) if sells_m5 > 0 else (99.0 if buys_m5 > 0 else 0.0)
         
-        prev = conn.execute("SELECT buy_sell_ratio, vol_m5 FROM snapshots WHERE token_address=? ORDER BY target_sec DESC LIMIT 1", (addr,)).fetchone()
-        bs_momentum = round(bs_ratio - (prev["buy_sell_ratio"] or 0), 2) if prev and prev["buy_sell_ratio"] else 0.0
-        prev_vol = prev["vol_m5"] if prev else (token["t0_vol_m5"] or 0)
-        vol_velocity = round((vol_m5 - prev_vol) / prev_vol * 100, 2) if prev_vol and prev_vol > 0 else 0.0
+        with db() as conn:
+            prev = conn.execute("SELECT buy_sell_ratio, vol_m5 FROM snapshots WHERE token_address=? ORDER BY target_sec DESC LIMIT 1", (addr,)).fetchone()
+            bs_momentum = round(bs_ratio - (prev["buy_sell_ratio"] or 0), 2) if prev and prev["buy_sell_ratio"] else 0.0
+            prev_vol = prev["vol_m5"] if prev else (token["t0_vol_m5"] or 0)
+            vol_velocity = round((vol_m5 - prev_vol) / prev_vol * 100, 2) if prev_vol and prev_vol > 0 else 0.0
 
-        for target in due:
-            conn.execute("""
-                INSERT OR IGNORE INTO snapshots
-                (token_address, target_sec, actual_sec, taken_at, price, liq, vol_m5,
-                 buys_m5, sells_m5, fdv, return_pct, liq_change_pct,
-                 buy_sell_ratio, buy_sell_momentum, volume_velocity, holders, sol_price)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (addr, target, elapsed, now, price, liq, vol_m5, buys_m5, sells_m5,
-                  fdv, ret, liq_change, bs_ratio, bs_momentum, vol_velocity, None, current_sol))
-            stats["snapshots_taken"] += 1
+            for target in due:
+                conn.execute("""
+                    INSERT OR IGNORE INTO snapshots
+                    (token_address, target_sec, actual_sec, taken_at, price, liq, vol_m5,
+                     buys_m5, sells_m5, fdv, return_pct, liq_change_pct,
+                     buy_sell_ratio, buy_sell_momentum, volume_velocity, holders, sol_price)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (addr, target, elapsed, now, price, liq, vol_m5, buys_m5, sells_m5,
+                      fdv, ret, liq_change, bs_ratio, bs_momentum, vol_velocity, None, current_sol))
+                stats["snapshots_taken"] += 1
 
-        if ret is not None and (token["peak_return"] is None or ret > (token["peak_return"] or -999)):
-            conn.execute("UPDATE tokens SET peak_price=?, peak_return=?, peak_time_sec=? WHERE address=?",
-                        (price, ret, elapsed, addr))
+            if ret is not None and (token["peak_return"] is None or ret > (token["peak_return"] or -999)):
+                conn.execute("UPDATE tokens SET peak_price=?, peak_return=?, peak_time_sec=? WHERE address=?",
+                            (price, ret, elapsed, addr))
         time.sleep(0.3)
-    conn.commit()
-    conn.close()
 
 
 # ── Pattern Classification ──────────────────────────────────────────────
 
 def _classify():
-    conn = get_db()
-    tokens = conn.execute("SELECT address FROM tokens WHERE snapshots_complete=1 AND pattern IS NULL").fetchall()
-    for token in tokens:
-        addr = token["address"]
-        snaps = conn.execute("SELECT target_sec, return_pct FROM snapshots WHERE token_address=? ORDER BY target_sec", (addr,)).fetchall()
-        if len(snaps) < 5:
-            conn.execute("UPDATE tokens SET pattern='insufficient_data' WHERE address=?", (addr,))
-            continue
-        returns = [s["return_pct"] or 0 for s in snaps]
-        times = [s["target_sec"] for s in snaps]
-        peak = max(returns)
-        final = returns[-1]
-        best_idx = returns.index(peak)
-        if peak > 50 and final < peak * 0.3: pattern = "pump_dump"
-        elif final > 20: pattern = "rocket" if all(returns[i] >= returns[i-1] - 2 for i in range(1, min(6, len(returns)))) else "slow_climb"
-        elif final < -30: pattern = "rug"
-        elif abs(final) < 5: pattern = "flat"
-        elif peak > 20 and final > 0: pattern = "volatile_up"
-        else: pattern = "volatile_down"
-        conn.execute("UPDATE tokens SET pattern=?, best_buy_sec=0, best_sell_sec=?, max_profit_pct=? WHERE address=?",
-                     (pattern, times[best_idx], peak, addr))
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        tokens = conn.execute("SELECT address FROM tokens WHERE snapshots_complete=1 AND pattern IS NULL").fetchall()
+        tokens = [dict(t) for t in tokens]
+        
+        for token in tokens:
+            addr = token["address"]
+            snaps = conn.execute("SELECT target_sec, return_pct FROM snapshots WHERE token_address=? ORDER BY target_sec", (addr,)).fetchall()
+            if len(snaps) < 5:
+                conn.execute("UPDATE tokens SET pattern='insufficient_data' WHERE address=?", (addr,))
+                continue
+            returns = [s["return_pct"] or 0 for s in snaps]
+            times = [s["target_sec"] for s in snaps]
+            peak = max(returns)
+            final = returns[-1]
+            if peak > 50 and final < peak * 0.3: pattern = "pump_dump"
+            elif final > 20: pattern = "rocket" if all(returns[i] >= returns[i-1] - 2 for i in range(1, min(6, len(returns)))) else "slow_climb"
+            elif final < -30: pattern = "rug"
+            elif abs(final) < 5: pattern = "flat"
+            elif peak > 20 and final > 0: pattern = "volatile_up"
+            else: pattern = "volatile_down"
+            best_idx = returns.index(peak)
+            conn.execute("UPDATE tokens SET pattern=?, best_buy_sec=0, best_sell_sec=?, max_profit_pct=? WHERE address=?",
+                         (pattern, times[best_idx], peak, addr))
 
 
 # ── Main Loop ───────────────────────────────────────────────────────────
@@ -1147,11 +1100,9 @@ def main_loop():
             
             if cycle % 100 == 0:
                 try:
-                    conn = get_db()
-                    cutoff = int(time.time()) - 3600
-                    conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
-                    conn.commit()
-                    conn.close()
+                    with db() as conn:
+                        cutoff = int(time.time()) - 3600
+                        conn.execute("DELETE FROM watchlist WHERE graduated=0 AND first_seen_ts < ?", (cutoff,))
                 except: pass
             
             _log(f"Cycle {cycle} | W={stats['pre_grad_watched']} T={stats['tokens_tracked']} A={stats['alerts_generated']} E={stats['errors']}")
@@ -1181,14 +1132,13 @@ def _watchdog():
 @app.route("/")
 def index():
     try:
-        conn = get_db()
-        total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
-        complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete=1").fetchone()["c"]
-        snaps = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
-        watched = conn.execute("SELECT COUNT(*) as c FROM watchlist WHERE graduated=0").fetchone()["c"]
-        pending_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE delivered=0").fetchone()["c"]
-        active_pos = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='active'").fetchone()["c"]
-        conn.close()
+        with db() as conn:
+            total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
+            complete = conn.execute("SELECT COUNT(*) as c FROM tokens WHERE snapshots_complete=1").fetchone()["c"]
+            snaps = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
+            watched = conn.execute("SELECT COUNT(*) as c FROM watchlist WHERE graduated=0").fetchone()["c"]
+            pending_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE delivered=0").fetchone()["c"]
+            active_pos = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='active'").fetchone()["c"]
     except Exception as e:
         return jsonify({"status": "running", "version": "v6-sniper", "db_busy": True, "error": str(e), "stats": stats})
     with sol_price_lock: sol = sol_price_usd
@@ -1223,85 +1173,76 @@ def logs():
 @app.route("/api/alerts/pending")
 def get_pending_alerts():
     """Get undelivered alerts — polled by cron for Telegram delivery."""
-    conn = get_db()
-    alerts = conn.execute("SELECT * FROM alerts WHERE delivered=0 ORDER BY created_ts").fetchall()
-    result = [dict(a) for a in alerts]
-    # Mark as delivered
-    for a in alerts:
-        conn.execute("UPDATE alerts SET delivered=1 WHERE id=?", (a["id"],))
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        alerts = conn.execute("SELECT * FROM alerts WHERE delivered=0 ORDER BY created_ts").fetchall()
+        result = [dict(a) for a in alerts]
+        for a in alerts:
+            conn.execute("UPDATE alerts SET delivered=1 WHERE id=?", (a["id"],))
     return jsonify({"count": len(result), "alerts": result})
 
 @app.route("/api/alerts")
 def get_all_alerts():
-    conn = get_db()
-    limit = flask_request.args.get("limit", type=int, default=50)
-    alerts = conn.execute("SELECT * FROM alerts ORDER BY created_ts DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
+    with db() as conn:
+        limit = flask_request.args.get("limit", type=int, default=50)
+        alerts = conn.execute("SELECT * FROM alerts ORDER BY created_ts DESC LIMIT ?", (limit,)).fetchall()
     return jsonify({"count": len(alerts), "alerts": [dict(a) for a in alerts]})
 
 @app.route("/api/watchlist")
 def get_watchlist():
-    conn = get_db()
-    items = conn.execute("SELECT * FROM watchlist WHERE graduated=0 ORDER BY velocity_score DESC LIMIT 50").fetchall()
-    conn.close()
+    with db() as conn:
+        items = conn.execute("SELECT * FROM watchlist WHERE graduated=0 ORDER BY velocity_score DESC LIMIT 50").fetchall()
     return jsonify({"count": len(items), "watchlist": [dict(i) for i in items]})
 
 @app.route("/api/positions")
 def get_positions():
-    conn = get_db()
-    active = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
-    closed = conn.execute("SELECT * FROM positions WHERE status='closed' ORDER BY rowid DESC LIMIT 20").fetchall()
-    conn.close()
+    with db() as conn:
+        active = conn.execute("SELECT * FROM positions WHERE status='active'").fetchall()
+        closed = conn.execute("SELECT * FROM positions WHERE status='closed' ORDER BY rowid DESC LIMIT 20").fetchall()
     return jsonify({"active": [dict(p) for p in active], "closed": [dict(p) for p in closed]})
 
 @app.route("/api/graduations")
 def get_graduations():
-    conn = get_db()
-    limit = flask_request.args.get("limit", type=int, default=50)
-    tokens = conn.execute("SELECT * FROM tokens ORDER BY detected_ts DESC LIMIT ?", (limit,)).fetchall()
-    results = []
-    for t in tokens:
-        token = dict(t)
-        snps = conn.execute("SELECT target_sec, price, return_pct, buy_sell_ratio, buy_sell_momentum, volume_velocity FROM snapshots WHERE token_address=? ORDER BY target_sec", (t["address"],)).fetchall()
-        token["curve"] = [dict(s) for s in snps]
-        results.append(token)
-    conn.close()
+    with db() as conn:
+        limit = flask_request.args.get("limit", type=int, default=50)
+        tokens = conn.execute("SELECT * FROM tokens ORDER BY detected_ts DESC LIMIT ?", (limit,)).fetchall()
+        results = []
+        for t in tokens:
+            token = dict(t)
+            snps = conn.execute("SELECT target_sec, price, return_pct, buy_sell_ratio, buy_sell_momentum, volume_velocity FROM snapshots WHERE token_address=? ORDER BY target_sec", (t["address"],)).fetchall()
+            token["curve"] = [dict(s) for s in snps]
+            results.append(token)
     return jsonify({"count": len(results), "graduations": results})
 
 @app.route("/api/curves")
 def get_curves():
-    conn = get_db()
-    tokens = conn.execute("SELECT address, pattern, peak_return, peak_time_sec, velocity_rating, v1_pct FROM tokens WHERE snapshots_complete=1").fetchall()
-    if not tokens:
-        conn.close()
-        return jsonify({"message": "No complete curves yet.", "total": 0})
-    time_buckets = {}
-    for target in SNAPSHOT_TIMES:
-        rows = conn.execute("SELECT return_pct, buy_sell_ratio, buy_sell_momentum, volume_velocity FROM snapshots WHERE target_sec=? AND return_pct IS NOT NULL", (target,)).fetchall()
-        if rows:
-            returns = [r["return_pct"] for r in rows]
-            winners = [r for r in returns if r > 0]
-            time_buckets[f"{target}s"] = {
-                "tokens": len(returns),
-                "avg_return": round(sum(returns)/len(returns), 2),
-                "win_rate": round(len(winners)/len(returns)*100, 1),
-                "best": round(max(returns), 2), "worst": round(min(returns), 2),
-            }
-    patterns = {}
-    velocity_impact = {}
-    for t in tokens:
-        p = t["pattern"] or "unknown"
-        patterns[p] = patterns.get(p, 0) + 1
-        v = t["velocity_rating"] or "UNKNOWN"
-        if v not in velocity_impact: velocity_impact[v] = {"count": 0, "peaks": []}
-        velocity_impact[v]["count"] += 1
-        velocity_impact[v]["peaks"].append(t["peak_return"] or 0)
-    for v in velocity_impact:
-        peaks = velocity_impact[v]["peaks"]
-        velocity_impact[v] = {"count": len(peaks), "avg_peak": round(sum(peaks)/len(peaks), 1) if peaks else 0}
-    conn.close()
+    with db() as conn:
+        tokens = conn.execute("SELECT address, pattern, peak_return, peak_time_sec, velocity_rating, v1_pct FROM tokens WHERE snapshots_complete=1").fetchall()
+        if not tokens:
+            return jsonify({"message": "No complete curves yet.", "total": 0})
+        time_buckets = {}
+        for target in SNAPSHOT_TIMES:
+            rows = conn.execute("SELECT return_pct, buy_sell_ratio, buy_sell_momentum, volume_velocity FROM snapshots WHERE target_sec=? AND return_pct IS NOT NULL", (target,)).fetchall()
+            if rows:
+                returns = [r["return_pct"] for r in rows]
+                winners = [r for r in returns if r > 0]
+                time_buckets[f"{target}s"] = {
+                    "tokens": len(returns),
+                    "avg_return": round(sum(returns)/len(returns), 2),
+                    "win_rate": round(len(winners)/len(returns)*100, 1),
+                    "best": round(max(returns), 2), "worst": round(min(returns), 2),
+                }
+        patterns = {}
+        velocity_impact = {}
+        for t in tokens:
+            p = t["pattern"] or "unknown"
+            patterns[p] = patterns.get(p, 0) + 1
+            v = t["velocity_rating"] or "UNKNOWN"
+            if v not in velocity_impact: velocity_impact[v] = {"count": 0, "peaks": []}
+            velocity_impact[v]["count"] += 1
+            velocity_impact[v]["peaks"].append(t["peak_return"] or 0)
+        for v in velocity_impact:
+            peaks = velocity_impact[v]["peaks"]
+            velocity_impact[v] = {"count": len(peaks), "avg_peak": round(sum(peaks)/len(peaks), 1) if peaks else 0}
     return jsonify({
         "total": len(tokens), "price_curves": time_buckets,
         "patterns": patterns, "velocity_impact": velocity_impact,
@@ -1309,12 +1250,11 @@ def get_curves():
 
 @app.route("/api/stats")
 def get_stats():
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
-    alerts_total = conn.execute("SELECT COUNT(*) as c FROM alerts").fetchone()["c"]
-    buy_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE alert_type='BUY'").fetchone()["c"]
-    exit_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE alert_type='EXIT'").fetchone()["c"]
-    conn.close()
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) as c FROM tokens").fetchone()["c"]
+        alerts_total = conn.execute("SELECT COUNT(*) as c FROM alerts").fetchone()["c"]
+        buy_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE alert_type='BUY'").fetchone()["c"]
+        exit_alerts = conn.execute("SELECT COUNT(*) as c FROM alerts WHERE alert_type='EXIT'").fetchone()["c"]
     with sol_price_lock: sol = sol_price_usd
     return jsonify({
         "version": "v6-sniper", "sol_usd": sol,
